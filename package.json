@@ -1,0 +1,26 @@
+{
+  "name": "api",
+  "type": "module",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "node src/main.js",
+    "start": "node src/main.js",
+    "lint": "eslint . --quiet"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^5.0.1",
+    "helmet": "^8.0.0",
+    "morgan": "^1.10.0",
+    "nodemailer": "^6.9.0",
+    "rss-parser": "^3.13.0",
+    "yahoo-finance2": "^3.14.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^8.57.0",
+    "eslint": "^8.57.1",
+    "globals": "^15.14.0"
+  }
+}
