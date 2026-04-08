@@ -73,6 +73,15 @@ router.get('/quote', async (req, res) => {
     fiftyTwoWeekLow:  quote.fiftyTwoWeekLow,
     marketState:    quote.marketState, // 'REGULAR' | 'CLOSED' | 'PRE' | 'POST'
     shortName:      quote.shortName ?? symbol,
+    // After-hours / pre-market
+    postMarketPrice:         quote.postMarketPrice         ?? null,
+    postMarketChange:        quote.postMarketChange        ?? null,
+    postMarketChangePercent: quote.postMarketChangePercent ?? null,
+    postMarketTime:          quote.postMarketTime          ?? null,
+    preMarketPrice:          quote.preMarketPrice          ?? null,
+    preMarketChange:         quote.preMarketChange         ?? null,
+    preMarketChangePercent:  quote.preMarketChangePercent  ?? null,
+    preMarketTime:           quote.preMarketTime           ?? null,
   });
 });
 
