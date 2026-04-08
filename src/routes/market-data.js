@@ -54,4 +54,26 @@ router.get('/', async (req, res) => {
   res.json(data);
 });
 
+// GET /market-data/quote?symbol=SPY  — single symbol quote + market state
+router.get('/quote', async (req, res) => {
+  const symbol = (req.query.symbol || 'SPY').toUpperCase();
+  const quote = await yf.quote(symbol);
+  res.json({
+    symbol,
+    price:          quote.regularMarketPrice,
+    previousClose:  quote.regularMarketPreviousClose,
+    change:         quote.regularMarketChange,
+    changePercent:  quote.regularMarketChangePercent,
+    bid:            quote.bid ?? null,
+    ask:            quote.ask ?? null,
+    volume:         quote.regularMarketVolume,
+    dayHigh:        quote.regularMarketDayHigh,
+    dayLow:         quote.regularMarketDayLow,
+    fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh,
+    fiftyTwoWeekLow:  quote.fiftyTwoWeekLow,
+    marketState:    quote.marketState, // 'REGULAR' | 'CLOSED' | 'PRE' | 'POST'
+    shortName:      quote.shortName ?? symbol,
+  });
+});
+
 export default router;
