@@ -237,4 +237,141 @@ router.get('/ff-proxy', async (req, res) => {
   res.json(factors.slice(-months));
 });
 
+// GET /market-data/options?ticker=QQQ
+// Returns vol smile data for up to 8 expirations
+router.get('/options', async (req, res) => {
+  const ticker = (req.query.ticker || 'QQQ').toUpperCase();
+  try {
+    // Fetch available expiry dates
+    const base = await yf.options(ticker, {}, { validateResult: false });
+    const expiryDates = base.expirationDates || [];
+    if (!expiryDates.length) return res.status(404).json({ error: 'No options data found for ' + ticker });
+
+    const spotQuote = await yf.quote(ticker, {}, { validateResult: false });
+    const spot = spotQuote.regularMarketPrice;
+
+    // Fetch chains for first 8 expirations
+    const selected = expiryDates.slice(0, 8);
+    const now = new Date();
+
+    const toDate = (d) => d instanceof Date ? d : new Date(d * 1000);
+
+    const chains = await Promise.allSettled(
+      selected.map(d => yf.options(ticker, { date: toDate(d) }, { validateResult: false }))
+    );
+
+    const surface = [];
+    chains.forEach((result, idx) => {
+      if (result.status !== 'fulfilled') return;
+      const chain = result.value;
+      const expDate = toDate(selected[idx]);
+      const dte = Math.max(1, Math.round((expDate - now) / (1000 * 60 * 60 * 24)));
+      const expiryStr = expDate.toISOString().slice(0, 10);
+
+      const opts = chain.options?.[0] || {};
+      const calls = opts.calls || [];
+      const puts  = opts.puts  || [];
+
+      // Use OTM side: puts for K < spot, calls for K >= spot
+      const strikeMap = {};
+      puts.forEach(p => {
+        const iv = p.impliedVolatility;
+        if (iv > 0.01 && iv < 3.0 && p.strike > 0) {
+          strikeMap[p.strike] = { strike: p.strike, iv, type: 'put', volume: p.volume ?? 0, oi: p.openInterest ?? 0 };
+        }
+      });
+      calls.forEach(c => {
+        const iv = c.impliedVolatility;
+        if (iv > 0.01 && iv < 3.0 && c.strike > 0) {
+          if (c.strike >= spot || !strikeMap[c.strike]) {
+            strikeMap[c.strike] = { strike: c.strike, iv, type: 'call', volume: c.volume ?? 0, oi: c.openInterest ?? 0 };
+          }
+        }
+      });
+
+      const strikes = Object.values(strikeMap).sort((a, b) => a.strike - b.strike);
+      if (strikes.length < 3) return;
+
+      surface.push({ expiry: expiryStr, dte, strikes });
+    });
+
+    res.json({ ticker, spot, surface });
+  } catch (err) {
+    console.error('[market-data /options]', ticker, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /market-data/fundamentals?ticker=AAPL
+// Returns 3-statement historical data + key metrics for DCF
+router.get('/fundamentals', async (req, res) => {
+  const ticker = (req.query.ticker || 'AAPL').toUpperCase();
+  try {
+    const summary = await yf.quoteSummary(ticker, {
+      modules: [
+        'incomeStatementHistory',
+        'balanceSheetHistory',
+        'cashFlowStatementHistory',
+        'financialData',
+        'defaultKeyStatistics',
+        'price',
+      ],
+    }, { validateResult: false });
+
+    const incomeStmts  = summary.incomeStatementHistory?.incomeStatementHistory  || [];
+    const balanceSheets = summary.balanceSheetHistory?.balanceSheetHistory         || [];
+    const cashFlows    = summary.cashFlowStatementHistory?.cashFlowStatementHistory || [];
+    const fd  = summary.financialData       || {};
+    const ks  = summary.defaultKeyStatistics || {};
+    const pr  = summary.price               || {};
+
+    const toYear = (d) => {
+      if (!d) return null;
+      if (d instanceof Date) return d.getFullYear();
+      const ms = d > 1e10 ? d : d * 1000;
+      return new Date(ms).getFullYear();
+    };
+
+    const years = incomeStmts.map((is, i) => {
+      const bs = balanceSheets[i] || {};
+      const cf = cashFlows[i]    || {};
+      const capex = cf.capitalExpenditures ?? null;
+      return {
+        year:             toYear(is.endDate),
+        revenue:          is.totalRevenue          ?? null,
+        grossProfit:      is.grossProfit            ?? null,
+        ebit:             is.ebit                   ?? null,
+        netIncome:        is.netIncome              ?? null,
+        interestExpense:  is.interestExpense        ?? null,
+        incomeTaxExpense: is.incomeTaxExpense       ?? null,
+        // Cash flow
+        operatingCF:      cf.totalCashFromOperatingActivities ?? null,
+        capex:            capex !== null ? Math.abs(capex) : null,  // store as positive
+        da:               cf.depreciation           ?? null,
+        // Balance sheet
+        cash:             bs.cash                   ?? null,
+        totalDebt:        (bs.longTermDebt ?? 0) + (bs.shortLongTermDebt ?? 0) || null,
+        totalCurrentAssets:      bs.totalCurrentAssets      ?? null,
+        totalCurrentLiabilities: bs.totalCurrentLiabilities ?? null,
+      };
+    }).filter(y => y.year !== null).reverse(); // chronological
+
+    res.json({
+      ticker,
+      shortName:         pr.shortName              ?? ticker,
+      currentPrice:      pr.regularMarketPrice     ?? null,
+      marketCap:         pr.marketCap              ?? null,
+      sharesOutstanding: ks.sharesOutstanding      ?? null,
+      beta:              ks.beta                   ?? null,
+      taxRate:           fd.effectiveTaxRate       ?? null,
+      totalDebt:         fd.totalDebt              ?? null,
+      totalCash:         fd.totalCash              ?? null,
+      years,
+    });
+  } catch (err) {
+    console.error('[market-data /fundamentals]', ticker, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;
