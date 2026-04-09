@@ -17,72 +17,87 @@ router.get('/', async (req, res) => {
     return res.json(cache);
   }
 
-  const quotes = await Promise.all(SYMBOLS.map(s => yf.quote(s)));
-  const [spx, vix, t10y, ndx] = quotes;
+  try {
+    const quotes = await Promise.all(
+      SYMBOLS.map(s => yf.quote(s, {}, { validateResult: false }))
+    );
+    const [spx, vix, t10y, ndx] = quotes;
 
-  const data = [
-    {
-      label: 'SPX',
-      value: spx.regularMarketPrice.toLocaleString('en-US', { maximumFractionDigits: 0 }),
-      unit: '',
-      positive: spx.regularMarketChangePercent >= 0,
-      change: `${spx.regularMarketChangePercent >= 0 ? '+' : ''}${spx.regularMarketChangePercent.toFixed(2)}%`,
-    },
-    {
-      label: 'NDX',
-      value: ndx.regularMarketPrice.toLocaleString('en-US', { maximumFractionDigits: 0 }),
-      unit: '',
-      positive: ndx.regularMarketChangePercent >= 0,
-      change: `${ndx.regularMarketChangePercent >= 0 ? '+' : ''}${ndx.regularMarketChangePercent.toFixed(2)}%`,
-    },
-    {
-      label: 'VIX',
-      value: vix.regularMarketPrice.toFixed(2),
-      unit: '',
-      positive: null,
-    },
-    {
-      label: '10Y',
-      value: t10y.regularMarketPrice.toFixed(2),
-      unit: '%',
-      positive: t10y.regularMarketChangePercent >= 0,
-    },
-  ];
+    const data = [
+      {
+        label: 'SPX',
+        value: spx.regularMarketPrice?.toLocaleString('en-US', { maximumFractionDigits: 0 }) ?? '—',
+        unit: '',
+        positive: (spx.regularMarketChangePercent ?? 0) >= 0,
+        change: spx.regularMarketChangePercent != null
+          ? `${spx.regularMarketChangePercent >= 0 ? '+' : ''}${spx.regularMarketChangePercent.toFixed(2)}%`
+          : '—',
+      },
+      {
+        label: 'NDX',
+        value: ndx.regularMarketPrice?.toLocaleString('en-US', { maximumFractionDigits: 0 }) ?? '—',
+        unit: '',
+        positive: (ndx.regularMarketChangePercent ?? 0) >= 0,
+        change: ndx.regularMarketChangePercent != null
+          ? `${ndx.regularMarketChangePercent >= 0 ? '+' : ''}${ndx.regularMarketChangePercent.toFixed(2)}%`
+          : '—',
+      },
+      {
+        label: 'VIX',
+        value: vix.regularMarketPrice?.toFixed(2) ?? '—',
+        unit: '',
+        positive: null,
+      },
+      {
+        label: '10Y',
+        value: t10y.regularMarketPrice?.toFixed(2) ?? '—',
+        unit: '%',
+        positive: (t10y.regularMarketChangePercent ?? 0) >= 0,
+      },
+    ];
 
-  cache = data;
-  cacheTime = now;
-  res.json(data);
+    cache = data;
+    cacheTime = now;
+    res.json(data);
+  } catch (err) {
+    console.error('[market-data /]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /market-data/quote?symbol=SPY  — single symbol quote + market state
 router.get('/quote', async (req, res) => {
   const symbol = (req.query.symbol || 'SPY').toUpperCase();
-  const quote = await yf.quote(symbol);
-  res.json({
-    symbol,
-    price:          quote.regularMarketPrice,
-    previousClose:  quote.regularMarketPreviousClose,
-    change:         quote.regularMarketChange,
-    changePercent:  quote.regularMarketChangePercent,
-    bid:            quote.bid ?? null,
-    ask:            quote.ask ?? null,
-    volume:         quote.regularMarketVolume,
-    dayHigh:        quote.regularMarketDayHigh,
-    dayLow:         quote.regularMarketDayLow,
-    fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh,
-    fiftyTwoWeekLow:  quote.fiftyTwoWeekLow,
-    marketState:    quote.marketState, // 'REGULAR' | 'CLOSED' | 'PRE' | 'POST'
-    shortName:      quote.shortName ?? symbol,
-    // After-hours / pre-market
-    postMarketPrice:         quote.postMarketPrice         ?? null,
-    postMarketChange:        quote.postMarketChange        ?? null,
-    postMarketChangePercent: quote.postMarketChangePercent ?? null,
-    postMarketTime:          quote.postMarketTime          ?? null,
-    preMarketPrice:          quote.preMarketPrice          ?? null,
-    preMarketChange:         quote.preMarketChange         ?? null,
-    preMarketChangePercent:  quote.preMarketChangePercent  ?? null,
-    preMarketTime:           quote.preMarketTime           ?? null,
-  });
+  try {
+    const quote = await yf.quote(symbol, {}, { validateResult: false });
+    res.json({
+      symbol,
+      price:          quote.regularMarketPrice          ?? null,
+      previousClose:  quote.regularMarketPreviousClose  ?? null,
+      change:         quote.regularMarketChange         ?? null,
+      changePercent:  quote.regularMarketChangePercent  ?? null,
+      bid:            quote.bid                         ?? null,
+      ask:            quote.ask                         ?? null,
+      volume:         quote.regularMarketVolume         ?? null,
+      dayHigh:        quote.regularMarketDayHigh        ?? null,
+      dayLow:         quote.regularMarketDayLow         ?? null,
+      fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh          ?? null,
+      fiftyTwoWeekLow:  quote.fiftyTwoWeekLow           ?? null,
+      marketState:    quote.marketState                 ?? 'CLOSED',
+      shortName:      quote.shortName                   ?? symbol,
+      postMarketPrice:         quote.postMarketPrice         ?? null,
+      postMarketChange:        quote.postMarketChange        ?? null,
+      postMarketChangePercent: quote.postMarketChangePercent ?? null,
+      postMarketTime:          quote.postMarketTime          ?? null,
+      preMarketPrice:          quote.preMarketPrice          ?? null,
+      preMarketChange:         quote.preMarketChange         ?? null,
+      preMarketChangePercent:  quote.preMarketChangePercent  ?? null,
+      preMarketTime:           quote.preMarketTime           ?? null,
+    });
+  } catch (err) {
+    console.error('[market-data /quote]', symbol, err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Historical data caches ────────────────────────────────────────────────────────
