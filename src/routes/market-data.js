@@ -307,54 +307,41 @@ router.get('/options', async (req, res) => {
 router.get('/fundamentals', async (req, res) => {
   const ticker = (req.query.ticker || 'AAPL').toUpperCase();
   try {
-    const summary = await yf.quoteSummary(ticker, {
-      modules: [
-        'incomeStatementHistory',
-        'balanceSheetHistory',
-        'cashFlowStatementHistory',
-        'financialData',
-        'defaultKeyStatistics',
-        'price',
-      ],
-    }, { validateResult: false });
+    // fundamentalsTimeSeries replaced the broken quoteSummary financial modules (Nov 2024)
+    const [tsRaw, summary] = await Promise.all([
+      yf.fundamentalsTimeSeries(ticker, {
+        type: 'annual', module: 'all', period1: '2019-01-01',
+      }),
+      yf.quoteSummary(ticker, {
+        modules: ['financialData', 'defaultKeyStatistics', 'price'],
+      }),
+    ]);
 
-    const incomeStmts  = summary.incomeStatementHistory?.incomeStatementHistory  || [];
-    const balanceSheets = summary.balanceSheetHistory?.balanceSheetHistory         || [];
-    const cashFlows    = summary.cashFlowStatementHistory?.cashFlowStatementHistory || [];
-    const fd  = summary.financialData       || {};
-    const ks  = summary.defaultKeyStatistics || {};
-    const pr  = summary.price               || {};
+    const fd = summary.financialData       || {};
+    const ks = summary.defaultKeyStatistics || {};
+    const pr = summary.price               || {};
 
-    const toYear = (d) => {
-      if (!d) return null;
-      if (d instanceof Date) return d.getFullYear();
-      const ms = d > 1e10 ? d : d * 1000;
-      return new Date(ms).getFullYear();
-    };
+    // fundamentalsTimeSeries returns an array-like object
+    const tsArr = Array.from(tsRaw)
+      .filter(item => item.date && item.totalRevenue)
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
 
-    const years = incomeStmts.map((is, i) => {
-      const bs = balanceSheets[i] || {};
-      const cf = cashFlows[i]    || {};
-      const capex = cf.capitalExpenditures ?? null;
-      return {
-        year:             toYear(is.endDate),
-        revenue:          is.totalRevenue          ?? null,
-        grossProfit:      is.grossProfit            ?? null,
-        ebit:             is.ebit                   ?? null,
-        netIncome:        is.netIncome              ?? null,
-        interestExpense:  is.interestExpense        ?? null,
-        incomeTaxExpense: is.incomeTaxExpense       ?? null,
-        // Cash flow
-        operatingCF:      cf.totalCashFromOperatingActivities ?? null,
-        capex:            capex !== null ? Math.abs(capex) : null,  // store as positive
-        da:               cf.depreciation           ?? null,
-        // Balance sheet
-        cash:             bs.cash                   ?? null,
-        totalDebt:        (bs.longTermDebt ?? 0) + (bs.shortLongTermDebt ?? 0) || null,
-        totalCurrentAssets:      bs.totalCurrentAssets      ?? null,
-        totalCurrentLiabilities: bs.totalCurrentLiabilities ?? null,
-      };
-    }).filter(y => y.year !== null).reverse(); // chronological
+    const years = tsArr.map(item => ({
+      year:         new Date(item.date).getFullYear(),
+      revenue:      item.totalRevenue                    ?? null,
+      grossProfit:  item.grossProfit                     ?? null,
+      ebit:         item.EBIT                            ?? item.operatingIncome ?? null,
+      ebitda:       item.EBITDA                          ?? null,
+      netIncome:    item.netIncome                       ?? null,
+      // Cash flow
+      operatingCF:  item.operatingCashFlow               ?? null,
+      capex:        item.capitalExpenditure != null ? Math.abs(item.capitalExpenditure) : null,
+      da:           item.depreciationAndAmortization     ?? item.reconciledDepreciation ?? null,
+      freeCashFlow: item.freeCashFlow                    ?? null,
+      // Balance sheet
+      cash:         item.cashCashEquivalentsAndShortTermInvestments ?? item.cashAndCashEquivalents ?? null,
+      totalDebt:    item.totalDebt                       ?? null,
+    }));
 
     res.json({
       ticker,
