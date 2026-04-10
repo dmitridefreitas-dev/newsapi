@@ -140,7 +140,7 @@ router.post('/', async (req, res) => {
         model: 'llama-3.1-8b-instant',
         messages,
         temperature: 0.7,
-        max_tokens: 900,
+        max_tokens: 1800,
       }),
     });
 
