@@ -52,7 +52,7 @@ router.post('/', async (req, res) => {
     if (!elResp.ok) {
       const errBody = await elResp.json().catch(() => ({}));
       console.error('[tts] ElevenLabs error:', elResp.status, JSON.stringify(errBody));
-      return res.status(502).json({ error: 'upstream_error' });
+      return res.status(502).json({ error: 'upstream_error', detail: errBody });
     }
 
     res.setHeader('Content-Type', 'audio/mpeg');
