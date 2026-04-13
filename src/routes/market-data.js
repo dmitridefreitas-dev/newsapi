@@ -4,18 +4,68 @@ import YahooFinance from 'yahoo-finance2';
 const router = express.Router();
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
+// ── Alpha Vantage helpers ──────────────────────────────────────────────────────
+const AV_BASE = 'https://www.alphavantage.co/query';
+
+function getAvKey() {
+  const k = process.env.ALPHA_VANTAGE_KEY;
+  if (!k) throw new Error('ALPHA_VANTAGE_KEY environment variable is not set');
+  return k;
+}
+
+async function avFetch(params) {
+  const url = new URL(AV_BASE);
+  url.searchParams.set('apikey', getAvKey());
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`Alpha Vantage HTTP ${res.status}`);
+  const data = await res.json();
+  if (data.Note || data.Information) {
+    throw new Error('Alpha Vantage rate limit — try again in a minute');
+  }
+  if (data['Error Message']) throw new Error(`Alpha Vantage: ${data['Error Message']}`);
+  return data;
+}
+
+function parseNum(v) {
+  if (v == null || v === 'None' || v === '-' || v === '') return null;
+  const n = parseFloat(v);
+  return isNaN(n) ? null : n;
+}
+
+// Fetch full monthly adjusted series; returns sorted [{date:'YYYY-MM-DD', adjClose}]
+async function avMonthly(symbol) {
+  const data = await avFetch({ function: 'TIME_SERIES_MONTHLY_ADJUSTED', symbol });
+  const series = data['Monthly Adjusted Time Series'] || {};
+  return Object.entries(series)
+    .map(([date, v]) => ({ date, adjClose: parseNum(v['5. adjusted close']) }))
+    .filter(r => r.adjClose != null)
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+// Fetch full daily adjusted series; returns sorted [{date:'YYYY-MM-DD', adjClose}]
+async function avDaily(symbol) {
+  const data = await avFetch({ function: 'TIME_SERIES_DAILY_ADJUSTED', symbol, outputsize: 'full' });
+  const series = data['Time Series (Daily)'] || {};
+  return Object.entries(series)
+    .map(([date, v]) => ({ date, adjClose: parseNum(v['5. adjusted close']) }))
+    .filter(r => r.adjClose != null)
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function dateKey(dateStr) {
+  return dateStr.slice(0, 7); // "YYYY-MM-DD" -> "YYYY-MM"
+}
+
+// ── Main header tickers — Yahoo Finance (index symbols not supported by AV) ───
 // ^GSPC = S&P 500, ^VIX = VIX, ^TNX = 10Y Treasury, ^NDX = Nasdaq 100
 const SYMBOLS = ['^GSPC', '^VIX', '^TNX', '^NDX'];
-
-let cache = null;
-let cacheTime = 0;
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+let cache = null, cacheTime = 0;
+const CACHE_TTL = 10 * 60 * 1000; // 10 min
 
 router.get('/', async (req, res) => {
   const now = Date.now();
-  if (cache && now - cacheTime < CACHE_TTL) {
-    return res.json(cache);
-  }
+  if (cache && now - cacheTime < CACHE_TTL) return res.json(cache);
 
   try {
     const quotes = await Promise.all(
@@ -61,58 +111,74 @@ router.get('/', async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('[market-data /]', err.message);
+    if (cache) return res.json(cache); // serve stale on error
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /market-data/quote?symbol=SPY  — single symbol quote + market state
+// ── Single quote — Alpha Vantage GLOBAL_QUOTE ─────────────────────────────────
+// GET /market-data/quote?symbol=SPY
+const QUOTE_CACHE = new Map();
+const QUOTE_TTL = 5 * 60 * 1000;
+
 router.get('/quote', async (req, res) => {
   const symbol = (req.query.symbol || 'SPY').toUpperCase();
+  const now = Date.now();
+  const cached = QUOTE_CACHE.get(symbol);
+  if (cached && now - cached.time < QUOTE_TTL) return res.json(cached.data);
+
   try {
-    const quote = await yf.quote(symbol, {}, { validateResult: false });
-    res.json({
+    const raw = await avFetch({ function: 'GLOBAL_QUOTE', symbol });
+    const q = raw['Global Quote'] || {};
+    if (!q['05. price']) throw new Error(`No quote data for ${symbol}`);
+
+    const price         = parseNum(q['05. price']);
+    const previousClose = parseNum(q['08. previous close']);
+    const change        = parseNum(q['09. change']);
+    // AV returns "0.6700%" — strip the % sign
+    const changePct     = parseNum((q['10. change percent'] || '').replace('%', ''));
+    const volume        = parseNum(q['06. volume']);
+
+    const data = {
       symbol,
-      price:          quote.regularMarketPrice          ?? null,
-      previousClose:  quote.regularMarketPreviousClose  ?? null,
-      change:         quote.regularMarketChange         ?? null,
-      changePercent:  quote.regularMarketChangePercent  ?? null,
-      bid:            quote.bid                         ?? null,
-      ask:            quote.ask                         ?? null,
-      volume:         quote.regularMarketVolume         ?? null,
-      dayHigh:        quote.regularMarketDayHigh        ?? null,
-      dayLow:         quote.regularMarketDayLow         ?? null,
-      fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh          ?? null,
-      fiftyTwoWeekLow:  quote.fiftyTwoWeekLow           ?? null,
-      marketState:    quote.marketState                 ?? 'CLOSED',
-      shortName:      quote.shortName                   ?? symbol,
-      postMarketPrice:         quote.postMarketPrice         ?? null,
-      postMarketChange:        quote.postMarketChange        ?? null,
-      postMarketChangePercent: quote.postMarketChangePercent ?? null,
-      postMarketTime:          quote.postMarketTime          ?? null,
-      preMarketPrice:          quote.preMarketPrice          ?? null,
-      preMarketChange:         quote.preMarketChange         ?? null,
-      preMarketChangePercent:  quote.preMarketChangePercent  ?? null,
-      preMarketTime:           quote.preMarketTime           ?? null,
-    });
+      price,
+      previousClose,
+      change,
+      changePercent:           changePct,
+      bid:                     null,
+      ask:                     null,
+      volume,
+      dayHigh:                 null,
+      dayLow:                  null,
+      fiftyTwoWeekHigh:        null,
+      fiftyTwoWeekLow:         null,
+      marketState:             null,  // frontend falls back to local clock-based detection
+      shortName:               symbol,
+      postMarketPrice:         null,
+      postMarketChange:        null,
+      postMarketChangePercent: null,
+      postMarketTime:          null,
+      preMarketPrice:          null,
+      preMarketChange:         null,
+      preMarketChangePercent:  null,
+      preMarketTime:           null,
+    };
+
+    QUOTE_CACHE.set(symbol, { data, time: now });
+    res.json(data);
   } catch (err) {
     console.error('[market-data /quote]', symbol, err.message);
+    const stale = QUOTE_CACHE.get(symbol);
+    if (stale) return res.json(stale.data);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Historical data caches ────────────────────────────────────────────────────────
-const MONTHLY_CACHE = new Map();
-const DAILY_CACHE   = new Map();
-let   FF_CACHE = null, FF_CACHE_TIME = 0;
-const MONTHLY_TTL = 60 * 60 * 1000;    // 1 h
-const DAILY_TTL   = 30 * 60 * 1000;    // 30 min
-const FF_TTL      =  6 * 60 * 60 * 1000; // 6 h
-
-function dateKey(d) {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-}
-
+// ── Monthly historical — Alpha Vantage TIME_SERIES_MONTHLY_ADJUSTED ───────────
 // GET /market-data/monthly?tickers=AAPL,MSFT,SPY&months=36
+const MONTHLY_CACHE = new Map();
+const MONTHLY_TTL = 60 * 60 * 1000; // 1 h
+
 router.get('/monthly', async (req, res) => {
   const tickers = (req.query.tickers || '')
     .split(',').map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 10);
@@ -124,28 +190,22 @@ router.get('/monthly', async (req, res) => {
   const cached = MONTHLY_CACHE.get(cacheKey);
   if (cached && now - cached.time < MONTHLY_TTL) return res.json(cached.data);
 
-  const period2 = new Date();
-  const period1 = new Date(); period1.setMonth(period1.getMonth() - months - 3);
-
   const results = {}, errors = {};
   await Promise.allSettled(tickers.map(async (ticker) => {
     try {
-      const rows = await yf.historical(ticker, {
-        period1: period1.toISOString().slice(0, 10),
-        period2: period2.toISOString().slice(0, 10),
-        interval: '1mo',
-      });
-      const pr = rows.filter(r => r.adjClose != null)
-        .sort((a, b) => new Date(a.date) - new Date(b.date));
-      if (pr.length < 3) { errors[ticker] = 'Insufficient data'; return; }
+      const rows = await avMonthly(ticker);
+      if (rows.length < 3) { errors[ticker] = 'Insufficient data'; return; }
+      // Take last (months + 1) rows so we can produce (months) return observations
+      const slice = rows.slice(-(months + 1));
       const out = [];
-      for (let i = 1; i < pr.length; i++) {
+      for (let i = 1; i < slice.length; i++) {
         out.push({
-          date: dateKey(new Date(pr[i].date)),
-          adjClose: +pr[i].adjClose.toFixed(4),
-          ret: +(pr[i].adjClose / pr[i - 1].adjClose - 1).toFixed(6),
+          date:     dateKey(slice[i].date),
+          adjClose: +slice[i].adjClose.toFixed(4),
+          ret:      +(slice[i].adjClose / slice[i - 1].adjClose - 1).toFixed(6),
         });
       }
+      if (out.length < 2) { errors[ticker] = 'Insufficient data after slicing'; return; }
       results[ticker] = out;
     } catch (err) { errors[ticker] = err.message; }
   }));
@@ -155,7 +215,11 @@ router.get('/monthly', async (req, res) => {
   res.json(data);
 });
 
+// ── Daily historical — Alpha Vantage TIME_SERIES_DAILY_ADJUSTED ───────────────
 // GET /market-data/daily?tickers=AAPL,SPY&start=2023-01-01&end=2024-06-01
+const DAILY_CACHE = new Map();
+const DAILY_TTL   = 30 * 60 * 1000; // 30 min
+
 router.get('/daily', async (req, res) => {
   const tickers = (req.query.tickers || '')
     .split(',').map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 5);
@@ -172,14 +236,11 @@ router.get('/daily', async (req, res) => {
   const results = {}, errors = {};
   await Promise.allSettled(tickers.map(async (ticker) => {
     try {
-      const rows = await yf.historical(ticker, {
-        period1: start, period2: end, interval: '1d',
-      });
-      const pr = rows.filter(r => r.adjClose != null)
-        .sort((a, b) => new Date(a.date) - new Date(b.date));
-      if (pr.length < 5) { errors[ticker] = 'Insufficient data'; return; }
-      results[ticker] = pr.map(r => ({
-        date: new Date(r.date).toISOString().slice(0, 10),
+      const rows = await avDaily(ticker);
+      const filtered = rows.filter(r => r.date >= start && r.date <= end);
+      if (filtered.length < 5) { errors[ticker] = 'Insufficient data'; return; }
+      results[ticker] = filtered.map(r => ({
+        date:     r.date,
         adjClose: +r.adjClose.toFixed(4),
       }));
     } catch (err) { errors[ticker] = err.message; }
@@ -190,59 +251,63 @@ router.get('/daily', async (req, res) => {
   res.json(data);
 });
 
+// ── Fama-French factor proxies — Alpha Vantage ────────────────────────────────
 // GET /market-data/ff-proxy?months=60
-// Returns FF3 factor proxies: MKT=SPY-BIL, SMB=IWM-SPY, HML=SPYV-SPYG
+// MKT=SPY-BIL, SMB=IWM-SPY, HML=SPYV-SPYG
+const FF_TICKERS = ['SPY', 'IWM', 'SPYV', 'SPYG', 'BIL'];
+let FF_CACHE = null, FF_CACHE_TIME = 0;
+const FF_TTL = 6 * 60 * 60 * 1000; // 6 h
+
 router.get('/ff-proxy', async (req, res) => {
   const months = Math.min(parseInt(req.query.months) || 60, 120);
   const now = Date.now();
   if (FF_CACHE && now - FF_CACHE_TIME < FF_TTL && FF_CACHE.length >= months)
     return res.json(FF_CACHE.slice(-months));
 
-  const TICKERS = ['SPY', 'IWM', 'SPYV', 'SPYG', 'BIL'];
-  const period2 = new Date();
-  const period1 = new Date(); period1.setMonth(period1.getMonth() - months - 3);
+  try {
+    const allData = {};
+    await Promise.all(FF_TICKERS.map(async (t) => {
+      const rows = await avMonthly(t);
+      const rets = [];
+      for (let i = 1; i < rows.length; i++) {
+        rets.push({
+          date: dateKey(rows[i].date),
+          ret:  rows[i].adjClose / rows[i - 1].adjClose - 1,
+        });
+      }
+      allData[t] = rets;
+    }));
 
-  const allData = {};
-  await Promise.all(TICKERS.map(async (t) => {
-    const rows = await yf.historical(t, {
-      period1: period1.toISOString().slice(0, 10),
-      period2: period2.toISOString().slice(0, 10),
-      interval: '1mo',
-    });
-    const pr = rows.filter(r => r.adjClose != null)
-      .sort((a, b) => new Date(a.date) - new Date(b.date));
-    const rets = [];
-    for (let i = 1; i < pr.length; i++) {
-      rets.push({ date: dateKey(new Date(pr[i].date)), ret: pr[i].adjClose / pr[i - 1].adjClose - 1 });
-    }
-    allData[t] = rets;
-  }));
+    const spyDates = (allData['SPY'] || []).map(r => r.date);
+    const factors = spyDates
+      .filter(d => FF_TICKERS.every(t => allData[t]?.some(r => r.date === d)))
+      .map(date => {
+        const g = (t) => allData[t].find(r => r.date === date)?.ret ?? 0;
+        const spy = g('SPY'), iwm = g('IWM'), spyv = g('SPYV'), spyg = g('SPYG'), bil = g('BIL');
+        return {
+          date,
+          rf:  +bil.toFixed(6),
+          mkt: +(spy  - bil).toFixed(6),
+          smb: +(iwm  - spy).toFixed(6),
+          hml: +(spyv - spyg).toFixed(6),
+        };
+      });
 
-  const spyDates = (allData['SPY'] || []).map(r => r.date);
-  const factors = spyDates
-    .filter(d => TICKERS.every(t => allData[t]?.some(r => r.date === d)))
-    .map(date => {
-      const g = (t) => allData[t].find(r => r.date === date)?.ret ?? 0;
-      const spy = g('SPY'), iwm = g('IWM'), spyv = g('SPYV'), spyg = g('SPYG'), bil = g('BIL');
-      return {
-        date,
-        rf:  +bil.toFixed(6),
-        mkt: +(spy  - bil).toFixed(6),
-        smb: +(iwm  - spy).toFixed(6),
-        hml: +(spyv - spyg).toFixed(6),
-      };
-    });
-
-  FF_CACHE = factors; FF_CACHE_TIME = now;
-  res.json(factors.slice(-months));
+    FF_CACHE = factors;
+    FF_CACHE_TIME = now;
+    res.json(factors.slice(-months));
+  } catch (err) {
+    console.error('[market-data /ff-proxy]', err.message);
+    if (FF_CACHE) return res.json(FF_CACHE.slice(-months));
+    res.status(500).json({ error: err.message });
+  }
 });
 
+// ── Options chain — Yahoo Finance (AV options requires a paid plan) ────────────
 // GET /market-data/options?ticker=QQQ
-// Returns vol smile data for up to 8 expirations
 router.get('/options', async (req, res) => {
   const ticker = (req.query.ticker || 'QQQ').toUpperCase();
   try {
-    // Fetch available expiry dates
     const base = await yf.options(ticker, {}, { validateResult: false });
     const expiryDates = base.expirationDates || [];
     if (!expiryDates.length) return res.status(404).json({ error: 'No options data found for ' + ticker });
@@ -250,10 +315,8 @@ router.get('/options', async (req, res) => {
     const spotQuote = await yf.quote(ticker, {}, { validateResult: false });
     const spot = spotQuote.regularMarketPrice;
 
-    // Fetch chains for first 8 expirations
     const selected = expiryDates.slice(0, 8);
     const now = new Date();
-
     const toDate = (d) => d instanceof Date ? d : new Date(d * 1000);
 
     const chains = await Promise.allSettled(
@@ -272,7 +335,6 @@ router.get('/options', async (req, res) => {
       const calls = opts.calls || [];
       const puts  = opts.puts  || [];
 
-      // Use OTM side: puts for K < spot, calls for K >= spot
       const strikeMap = {};
       puts.forEach(p => {
         const iv = p.impliedVolatility;
@@ -291,7 +353,6 @@ router.get('/options', async (req, res) => {
 
       const strikes = Object.values(strikeMap).sort((a, b) => a.strike - b.strike);
       if (strikes.length < 3) return;
-
       surface.push({ expiry: expiryStr, dte, strikes });
     });
 
@@ -302,61 +363,197 @@ router.get('/options', async (req, res) => {
   }
 });
 
+// ── Fundamentals — Alpha Vantage ──────────────────────────────────────────────
 // GET /market-data/fundamentals?ticker=AAPL
-// Returns 3-statement historical data + key metrics for DCF
+const FUND_CACHE = new Map();
+const FUND_TTL = 6 * 60 * 60 * 1000; // 6 h
+
 router.get('/fundamentals', async (req, res) => {
   const ticker = (req.query.ticker || 'AAPL').toUpperCase();
+  const now = Date.now();
+  const cached = FUND_CACHE.get(ticker);
+  if (cached && now - cached.time < FUND_TTL) return res.json(cached.data);
+
   try {
-    // fundamentalsTimeSeries replaced the broken quoteSummary financial modules (Nov 2024)
-    const [tsRaw, summary] = await Promise.all([
-      yf.fundamentalsTimeSeries(ticker, {
-        type: 'annual', module: 'all', period1: '2019-01-01',
-      }),
-      yf.quoteSummary(ticker, {
-        modules: ['financialData', 'defaultKeyStatistics', 'price'],
-      }),
+    const [overview, income, cashflow, balance, quoteRaw] = await Promise.all([
+      avFetch({ function: 'OVERVIEW',         symbol: ticker }),
+      avFetch({ function: 'INCOME_STATEMENT', symbol: ticker }),
+      avFetch({ function: 'CASH_FLOW',        symbol: ticker }),
+      avFetch({ function: 'BALANCE_SHEET',    symbol: ticker }),
+      avFetch({ function: 'GLOBAL_QUOTE',     symbol: ticker }),
     ]);
 
-    const fd = summary.financialData       || {};
-    const ks = summary.defaultKeyStatistics || {};
-    const pr = summary.price               || {};
+    const incomeReports  = income.annualReports  || [];
+    const cashReports    = cashflow.annualReports || [];
+    const balanceReports = balance.annualReports  || [];
 
-    // fundamentalsTimeSeries returns an array-like object
-    const tsArr = Array.from(tsRaw)
-      .filter(item => item.date && item.totalRevenue)
-      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    const cashMap    = Object.fromEntries(cashReports.map(r   => [r.fiscalDateEnding, r]));
+    const balanceMap = Object.fromEntries(balanceReports.map(r => [r.fiscalDateEnding, r]));
 
-    const years = tsArr.map(item => ({
-      year:         new Date(item.date).getFullYear(),
-      revenue:      item.totalRevenue                    ?? null,
-      grossProfit:  item.grossProfit                     ?? null,
-      ebit:         item.EBIT                            ?? item.operatingIncome ?? null,
-      ebitda:       item.EBITDA                          ?? null,
-      netIncome:    item.netIncome                       ?? null,
-      // Cash flow
-      operatingCF:  item.operatingCashFlow               ?? null,
-      capex:        item.capitalExpenditure != null ? Math.abs(item.capitalExpenditure) : null,
-      da:           item.depreciationAndAmortization     ?? item.reconciledDepreciation ?? null,
-      freeCashFlow: item.freeCashFlow                    ?? null,
-      // Balance sheet
-      cash:         item.cashCashEquivalentsAndShortTermInvestments ?? item.cashAndCashEquivalents ?? null,
-      totalDebt:    item.totalDebt                       ?? null,
-    }));
+    const years = incomeReports
+      .filter(r => r.totalRevenue && r.totalRevenue !== 'None')
+      .sort((a, b) => a.fiscalDateEnding.localeCompare(b.fiscalDateEnding))
+      .map(inc => {
+        const cf = cashMap[inc.fiscalDateEnding]    || {};
+        const bs = balanceMap[inc.fiscalDateEnding] || {};
 
-    res.json({
+        const operatingCF = parseNum(cf.operatingCashflow);
+        const capexRaw    = parseNum(cf.capitalExpenditures);
+        const capex       = capexRaw != null ? Math.abs(capexRaw) : null;
+        const da          = parseNum(cf.depreciationDepletionAndAmortization)
+                         ?? parseNum(inc.depreciationAndAmortization);
+        const fcf         = operatingCF != null && capex != null ? operatingCF - capex : null;
+
+        return {
+          year:         parseInt(inc.fiscalDateEnding.slice(0, 4)),
+          revenue:      parseNum(inc.totalRevenue),
+          grossProfit:  parseNum(inc.grossProfit),
+          ebit:         parseNum(inc.ebit) ?? parseNum(inc.operatingIncome),
+          ebitda:       parseNum(inc.ebitda),
+          netIncome:    parseNum(inc.netIncome),
+          operatingCF,
+          capex,
+          da,
+          freeCashFlow: fcf,
+          cash:      parseNum(bs.cashAndShortTermInvestments)
+                  ?? parseNum(bs.cashAndCashEquivalentsAtCarryingValue),
+          totalDebt: parseNum(bs.shortLongTermDebtTotal) ?? parseNum(bs.longTermDebt),
+        };
+      })
+      .filter(y => y.revenue != null);
+
+    // Effective tax rate from most recent annual report
+    const lastInc      = [...incomeReports].sort((a, b) => b.fiscalDateEnding.localeCompare(a.fiscalDateEnding))[0] || {};
+    const incomeBefore = parseNum(lastInc.incomeBeforeTax);
+    const incomeTax    = parseNum(lastInc.incomeTaxExpense);
+    const taxRate      = incomeBefore && incomeTax && incomeBefore > 0
+      ? Math.min(incomeTax / incomeBefore, 0.60)
+      : null;
+
+    const gq = quoteRaw['Global Quote'] || {};
+    const currentPrice = parseNum(gq['05. price']);
+
+    const latestBs = [...balanceReports].sort((a, b) =>
+      b.fiscalDateEnding.localeCompare(a.fiscalDateEnding))[0] || {};
+
+    const data = {
       ticker,
-      shortName:         pr.shortName              ?? ticker,
-      currentPrice:      pr.regularMarketPrice     ?? null,
-      marketCap:         pr.marketCap              ?? null,
-      sharesOutstanding: ks.sharesOutstanding      ?? null,
-      beta:              ks.beta                   ?? null,
-      taxRate:           fd.effectiveTaxRate       ?? null,
-      totalDebt:         fd.totalDebt              ?? null,
-      totalCash:         fd.totalCash              ?? null,
+      shortName:         overview.Name || ticker,
+      currentPrice,
+      marketCap:         parseNum(overview.MarketCapitalization),
+      sharesOutstanding: parseNum(overview.SharesOutstanding),
+      beta:              parseNum(overview.Beta),
+      taxRate,
+      totalDebt:  parseNum(latestBs.shortLongTermDebtTotal) ?? parseNum(latestBs.longTermDebt),
+      totalCash:  parseNum(latestBs.cashAndShortTermInvestments)
+               ?? parseNum(latestBs.cashAndCashEquivalentsAtCarryingValue),
       years,
-    });
+    };
+
+    FUND_CACHE.set(ticker, { data, time: now });
+    res.json(data);
   } catch (err) {
     console.error('[market-data /fundamentals]', ticker, err.message);
+    const stale = FUND_CACHE.get(ticker);
+    if (stale) return res.json(stale.data);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Morning Note — Yahoo Finance (needs futures + yield curve, not in AV) ─────
+// GET /market-data/morning-note
+let MN_CACHE = null, MN_CACHE_TIME = 0;
+const MN_TTL = 15 * 60 * 1000; // 15 min
+
+const YIELD_TICKERS  = { '3M': '^IRX', '2Y': '^TYX', '5Y': '^FVX', '10Y': '^TNX' };
+const FUTURE_TICKERS = { 'ES': 'ES=F', 'NQ': 'NQ=F', 'YM': 'YM=F' };
+const MOVER_WATCHLIST = ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'JPM', 'GS', 'SPY'];
+
+function buildHeadline({ yields, futures, movers }) {
+  const lines = [];
+  const esPct = futures.find(f => f.label === 'ES')?.changePercent ?? 0;
+  if (Math.abs(esPct) >= 0.1) {
+    lines.push(`S&P futures ${esPct >= 0 ? 'pointing higher' : 'pointing lower'} (ES ${esPct >= 0 ? '+' : ''}${esPct.toFixed(2)}%)`);
+  } else {
+    lines.push('Futures near flat');
+  }
+  const y10 = yields.find(y => y.label === '10Y')?.value;
+  const y3m = yields.find(y => y.label === '3M')?.value;
+  if (y10 != null && y3m != null) {
+    const spread = (y10 - y3m).toFixed(2);
+    lines.push(`10Y-3M spread ${spread >= 0 ? '+' : ''}${spread}bps`);
+  }
+  const sorted = [...movers].sort((a, b) => Math.abs(b.changePercent) - Math.abs(a.changePercent));
+  if (sorted.length) {
+    const top = sorted[0];
+    lines.push(`${top.symbol} ${top.changePercent >= 0 ? '+' : ''}${top.changePercent?.toFixed(2)}% pre-mkt`);
+  }
+  return lines.join(' · ');
+}
+
+router.get('/morning-note', async (req, res) => {
+  const now = Date.now();
+  if (MN_CACHE && now - MN_CACHE_TIME < MN_TTL) return res.json(MN_CACHE);
+
+  try {
+    const yieldEntries = Object.entries(YIELD_TICKERS);
+    const yieldQuotes = await Promise.allSettled(
+      yieldEntries.map(([, sym]) => yf.quote(sym, {}, { validateResult: false }))
+    );
+    const yields = yieldEntries.map(([label], i) => {
+      const q = yieldQuotes[i].status === 'fulfilled' ? yieldQuotes[i].value : null;
+      return {
+        label,
+        value:         q?.regularMarketPrice        ?? null,
+        change:        q?.regularMarketChange       ?? null,
+        changePercent: q?.regularMarketChangePercent ?? null,
+      };
+    });
+
+    const futureEntries = Object.entries(FUTURE_TICKERS);
+    const futureQuotes = await Promise.allSettled(
+      futureEntries.map(([, sym]) => yf.quote(sym, {}, { validateResult: false }))
+    );
+    const futures = futureEntries.map(([label], i) => {
+      const q = futureQuotes[i].status === 'fulfilled' ? futureQuotes[i].value : null;
+      return {
+        label,
+        value:         q?.regularMarketPrice        ?? null,
+        change:        q?.regularMarketChange       ?? null,
+        changePercent: q?.regularMarketChangePercent ?? null,
+        marketState:   q?.marketState               ?? 'CLOSED',
+      };
+    });
+
+    const moverQuotes = await Promise.allSettled(
+      MOVER_WATCHLIST.map(sym => yf.quote(sym, {}, { validateResult: false }))
+    );
+    const movers = MOVER_WATCHLIST
+      .map((sym, i) => {
+        const q = moverQuotes[i].status === 'fulfilled' ? moverQuotes[i].value : null;
+        if (!q) return null;
+        const hasPreMarket = q.preMarketPrice != null && q.preMarketChangePercent != null;
+        return {
+          symbol:        sym,
+          price:         hasPreMarket ? q.preMarketPrice         : (q.regularMarketPrice        ?? null),
+          changePercent: hasPreMarket ? q.preMarketChangePercent : (q.regularMarketChangePercent ?? 0),
+          change:        hasPreMarket ? q.preMarketChange        : (q.regularMarketChange        ?? 0),
+          isPreMarket:   hasPreMarket,
+          shortName:     q.shortName ?? sym,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => Math.abs(b.changePercent) - Math.abs(a.changePercent));
+
+    const headline = buildHeadline({ yields, futures, movers });
+    const data = { headline, yields, futures, movers, asOf: new Date().toISOString() };
+
+    MN_CACHE = data;
+    MN_CACHE_TIME = now;
+    res.json(data);
+  } catch (err) {
+    console.error('[market-data /morning-note]', err.message);
+    if (MN_CACHE) return res.json(MN_CACHE); // serve stale on error
     res.status(500).json({ error: err.message });
   }
 });
