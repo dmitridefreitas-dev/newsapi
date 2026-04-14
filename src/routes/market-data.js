@@ -4,6 +4,24 @@ import YahooFinance from 'yahoo-finance2';
 const router = express.Router();
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
+// ── Request queues — serialize external calls to avoid burst rate-limits ───────
+// AV free tier: 5 req/min. Yahoo: IP-rate-limits on burst. Both need throttling.
+const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+function makeQueue(gapMs) {
+  let tail = Promise.resolve();
+  return function enqueue(fn) {
+    const result = tail.then(() => fn());
+    tail = result.then(() => delay(gapMs), () => delay(gapMs));
+    return result;
+  };
+}
+
+// 1 AV call every 13s → max ~4.6/min, safely under the 5/min cap
+const avQueue  = makeQueue(13000);
+// 1 Yahoo call every 400ms — spreads burst, avoids crumb hammering
+const yfQueue  = makeQueue(400);
+
 // ── Alpha Vantage helpers ──────────────────────────────────────────────────────
 const AV_BASE = 'https://www.alphavantage.co/query';
 
@@ -14,17 +32,27 @@ function getAvKey() {
 }
 
 async function avFetch(params) {
-  const url = new URL(AV_BASE);
-  url.searchParams.set('apikey', getAvKey());
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`Alpha Vantage HTTP ${res.status}`);
-  const data = await res.json();
-  if (data.Note || data.Information) {
-    throw new Error('Alpha Vantage rate limit — try again in a minute');
-  }
-  if (data['Error Message']) throw new Error(`Alpha Vantage: ${data['Error Message']}`);
-  return data;
+  return avQueue(async () => {
+    const url = new URL(AV_BASE);
+    url.searchParams.set('apikey', getAvKey());
+    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+    const res = await fetch(url.toString());
+    if (!res.ok) throw new Error(`Alpha Vantage HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.Note || data.Information) {
+      throw new Error('Alpha Vantage rate limit — try again in a minute');
+    }
+    if (data['Error Message']) throw new Error(`Alpha Vantage: ${data['Error Message']}`);
+    return data;
+  });
+}
+
+async function yfQuote(symbol) {
+  return yfQueue(() => yf.quote(symbol, {}, { validateResult: false }));
+}
+
+async function yfOptions(symbol, opts) {
+  return yfQueue(() => yf.options(symbol, opts || {}, { validateResult: false }));
 }
 
 function parseNum(v) {
@@ -63,22 +91,13 @@ const SYMBOLS = ['^GSPC', '^VIX', '^TNX', '^NDX'];
 let cache = null, cacheTime = 0;
 const CACHE_TTL = 15 * 60 * 1000; // 15 min
 
-// Fetch symbols sequentially with a small gap to avoid bursting Yahoo's crumb endpoint
-async function fetchSymbolsSequential(symbols) {
-  const results = [];
-  for (const s of symbols) {
-    results.push(await yf.quote(s, {}, { validateResult: false }));
-    await new Promise(r => setTimeout(r, 250));
-  }
-  return results;
-}
-
 router.get('/', async (req, res) => {
   const now = Date.now();
   if (cache && now - cacheTime < CACHE_TTL) return res.json(cache);
 
   try {
-    const [spx, vix, t10y, ndx] = await fetchSymbolsSequential(SYMBOLS);
+    // yfQueue serializes these with 400ms gaps — no burst on cold start
+    const [spx, vix, t10y, ndx] = await Promise.all(SYMBOLS.map(s => yfQuote(s)));
 
     const data = [
       {
@@ -315,11 +334,11 @@ router.get('/ff-proxy', async (req, res) => {
 router.get('/options', async (req, res) => {
   const ticker = (req.query.ticker || 'QQQ').toUpperCase();
   try {
-    const base = await yf.options(ticker, {}, { validateResult: false });
+    const base = await yfOptions(ticker);
     const expiryDates = base.expirationDates || [];
     if (!expiryDates.length) return res.status(404).json({ error: 'No options data found for ' + ticker });
 
-    const spotQuote = await yf.quote(ticker, {}, { validateResult: false });
+    const spotQuote = await yfQuote(ticker);
     const spot = spotQuote.regularMarketPrice;
 
     const selected = expiryDates.slice(0, 8);
@@ -327,7 +346,7 @@ router.get('/options', async (req, res) => {
     const toDate = (d) => d instanceof Date ? d : new Date(d * 1000);
 
     const chains = await Promise.allSettled(
-      selected.map(d => yf.options(ticker, { date: toDate(d) }, { validateResult: false }))
+      selected.map(d => yfOptions(ticker, { date: toDate(d) }))
     );
 
     const surface = [];
@@ -505,7 +524,7 @@ router.get('/morning-note', async (req, res) => {
   try {
     const yieldEntries = Object.entries(YIELD_TICKERS);
     const yieldQuotes = await Promise.allSettled(
-      yieldEntries.map(([, sym]) => yf.quote(sym, {}, { validateResult: false }))
+      yieldEntries.map(([, sym]) => yfQuote(sym))
     );
     const yields = yieldEntries.map(([label], i) => {
       const q = yieldQuotes[i].status === 'fulfilled' ? yieldQuotes[i].value : null;
@@ -519,7 +538,7 @@ router.get('/morning-note', async (req, res) => {
 
     const futureEntries = Object.entries(FUTURE_TICKERS);
     const futureQuotes = await Promise.allSettled(
-      futureEntries.map(([, sym]) => yf.quote(sym, {}, { validateResult: false }))
+      futureEntries.map(([, sym]) => yfQuote(sym))
     );
     const futures = futureEntries.map(([label], i) => {
       const q = futureQuotes[i].status === 'fulfilled' ? futureQuotes[i].value : null;
@@ -533,7 +552,7 @@ router.get('/morning-note', async (req, res) => {
     });
 
     const moverQuotes = await Promise.allSettled(
-      MOVER_WATCHLIST.map(sym => yf.quote(sym, {}, { validateResult: false }))
+      MOVER_WATCHLIST.map(sym => yfQuote(sym))
     );
     const movers = MOVER_WATCHLIST
       .map((sym, i) => {
