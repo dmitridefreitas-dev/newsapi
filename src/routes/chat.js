@@ -121,7 +121,6 @@ router.post('/', async (req, res) => {
     if (!key) return res.status(500).json({ error: 'missing_api_key' });
 
     const clientMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
-
     const messages = [
       { role: 'system', content: buildSystemPrompt() },
       ...clientMessages
@@ -132,33 +131,39 @@ router.post('/', async (req, res) => {
 
     const groqResp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${key}`,
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
       body: JSON.stringify({
         model: 'llama-3.1-8b-instant',
         messages,
         temperature: 0.7,
         max_tokens: 1800,
+        stream: true,
       }),
     });
 
     if (!groqResp.ok) {
       const errBody = await groqResp.json().catch(() => ({}));
       console.error('[chat] Groq error:', groqResp.status, JSON.stringify(errBody));
-      return res.status(502).json({ error: 'upstream_error', status: groqResp.status, detail: errBody });
+      return res.status(502).json({ error: 'upstream_error', status: groqResp.status });
     }
 
-    const data = await groqResp.json();
-    const reply = data?.choices?.[0]?.message?.content?.trim();
-    if (!reply) return res.status(502).json({ error: 'empty_response' });
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
 
-    console.log(`[chat] ok ip=${ip}`);
-    return res.json({ reply });
+    const reader = groqResp.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(decoder.decode(value, { stream: true }));
+    }
+    res.end();
+    console.log(`[chat] stream ok ip=${ip}`);
   } catch (err) {
     console.error('[chat] error:', err.message);
-    return res.status(500).json({ error: 'server_error' });
+    if (!res.headersSent) res.status(500).json({ error: 'server_error' });
   }
 });
 

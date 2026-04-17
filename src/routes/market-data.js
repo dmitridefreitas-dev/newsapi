@@ -5,7 +5,9 @@ const router = express.Router();
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
 // ── Request queues — serialize external calls to avoid burst rate-limits ───────
-// AV free tier: 5 req/min. Yahoo: IP-rate-limits on burst. Both need throttling.
+// AV free tier: 25 req/DAY total (not 5/min — the per-minute cap no longer applies).
+// We keep a gentle gap between AV calls so concurrent requests from the frontend
+// don't double-hit the daily cap in a single burst.
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
 function makeQueue(gapMs) {
@@ -17,10 +19,10 @@ function makeQueue(gapMs) {
   };
 }
 
-// 1 AV call every 13s → max ~4.6/min, safely under the 5/min cap
-const avQueue  = makeQueue(13000);
-// 1 Yahoo call every 400ms — spreads burst, avoids crumb hammering
-const yfQueue  = makeQueue(400);
+// 1 AV call every 1.5s — gentle pacing for the 25/day tier
+const avQueue  = makeQueue(1500);
+// 1 Yahoo call every 350ms — spreads burst, avoids crumb hammering
+const yfQueue  = makeQueue(350);
 
 // ── Alpha Vantage helpers ──────────────────────────────────────────────────────
 const AV_BASE = 'https://www.alphavantage.co/query';
@@ -29,6 +31,11 @@ function getAvKey() {
   const k = process.env.ALPHA_VANTAGE_KEY;
   if (!k) throw new Error('ALPHA_VANTAGE_KEY environment variable is not set');
   return k;
+}
+
+// Custom error class so callers can distinguish rate-limit from other failures
+class AVRateLimitError extends Error {
+  constructor(msg) { super(msg); this.code = 'rate_limited'; }
 }
 
 async function avFetch(params) {
@@ -40,7 +47,9 @@ async function avFetch(params) {
     if (!res.ok) throw new Error(`Alpha Vantage HTTP ${res.status}`);
     const data = await res.json();
     if (data.Note || data.Information) {
-      throw new Error('Alpha Vantage rate limit — try again in a minute');
+      throw new AVRateLimitError(
+        'Alpha Vantage daily limit reached (25 requests/day on the free tier). Try again tomorrow or set a paid ALPHA_VANTAGE_KEY.'
+      );
     }
     if (data['Error Message']) throw new Error(`Alpha Vantage: ${data['Error Message']}`);
     return data;
@@ -55,13 +64,40 @@ async function yfOptions(symbol, opts) {
   return yfQueue(() => yf.options(symbol, opts || {}, { validateResult: false }));
 }
 
+// Yahoo Finance historical — returns [{date, open, high, low, close, adjClose, volume}]
+async function yfHistorical(symbol, { months, interval = '1mo' } = {}) {
+  const endDate = new Date();
+  const startDate = new Date();
+  // Extra buffer for the return calc (we need one row before the first target month)
+  const bufferMonths = interval === '1mo' ? 3 : 0;
+  startDate.setMonth(startDate.getMonth() - (months ?? 60) - bufferMonths);
+  return yfQueue(() => yf.historical(
+    symbol,
+    {
+      period1: startDate.toISOString().slice(0, 10),
+      period2: endDate.toISOString().slice(0, 10),
+      interval,
+    },
+    { validateResult: false }
+  ));
+}
+
+// Yahoo Finance historical — daily, start/end window
+async function yfHistoricalDaily(symbol, start, end) {
+  return yfQueue(() => yf.historical(
+    symbol,
+    { period1: start, period2: end, interval: '1d' },
+    { validateResult: false }
+  ));
+}
+
 function parseNum(v) {
   if (v == null || v === 'None' || v === '-' || v === '') return null;
   const n = parseFloat(v);
   return isNaN(n) ? null : n;
 }
 
-// Fetch full monthly adjusted series; returns sorted [{date:'YYYY-MM-DD', adjClose}]
+// Fetch full monthly adjusted series from AV; [{date:'YYYY-MM-DD', adjClose}]
 async function avMonthly(symbol) {
   const data = await avFetch({ function: 'TIME_SERIES_MONTHLY_ADJUSTED', symbol });
   const series = data['Monthly Adjusted Time Series'] || {};
@@ -71,7 +107,7 @@ async function avMonthly(symbol) {
     .sort((a, b) => a.date.localeCompare(b.date));
 }
 
-// Fetch full daily adjusted series; returns sorted [{date:'YYYY-MM-DD', adjClose}]
+// Fetch full daily adjusted series from AV
 async function avDaily(symbol) {
   const data = await avFetch({ function: 'TIME_SERIES_DAILY_ADJUSTED', symbol, outputsize: 'full' });
   const series = data['Time Series (Daily)'] || {};
@@ -85,8 +121,20 @@ function dateKey(dateStr) {
   return dateStr.slice(0, 7); // "YYYY-MM-DD" -> "YYYY-MM"
 }
 
+// Normalize a Yahoo historical row -> {date, adjClose}
+function yfRowsToSeries(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .map(r => {
+      const d = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10);
+      const ac = r.adjClose ?? r.close;
+      return ac != null ? { date: d, adjClose: +ac } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
 // ── Main header tickers — Yahoo Finance (index symbols not supported by AV) ───
-// ^GSPC = S&P 500, ^VIX = VIX, ^TNX = 10Y Treasury, ^NDX = Nasdaq 100
 const SYMBOLS = ['^GSPC', '^VIX', '^TNX', '^NDX'];
 let cache = null, cacheTime = 0;
 const CACHE_TTL = 15 * 60 * 1000; // 15 min
@@ -96,7 +144,6 @@ router.get('/', async (req, res) => {
   if (cache && now - cacheTime < CACHE_TTL) return res.json(cache);
 
   try {
-    // yfQueue serializes these with 400ms gaps — no burst on cold start
     const [spx, vix, t10y, ndx] = await Promise.all(SYMBOLS.map(s => yfQuote(s)));
 
     const data = [
@@ -137,16 +184,14 @@ router.get('/', async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('[market-data /]', err.message);
-    if (cache) return res.json(cache); // serve stale on error
+    if (cache) return res.json(cache);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Single quote — Alpha Vantage GLOBAL_QUOTE ─────────────────────────────────
-// (Yahoo Finance is rate-limited by IP on Render's shared infrastructure)
-// GET /market-data/quote?symbol=SPY
+// ── Single quote — Yahoo Finance primary ──────────────────────────────────────
 const QUOTE_CACHE = new Map();
-const QUOTE_TTL = 10 * 60 * 1000; // 10 min
+const QUOTE_TTL = 10 * 60 * 1000;
 
 router.get('/quote', async (req, res) => {
   const symbol = (req.query.symbol || 'SPY').toUpperCase();
@@ -155,39 +200,32 @@ router.get('/quote', async (req, res) => {
   if (cached && now - cached.time < QUOTE_TTL) return res.json(cached.data);
 
   try {
-    const raw = await avFetch({ function: 'GLOBAL_QUOTE', symbol });
-    const q = raw['Global Quote'] || {};
-    if (!q['05. price']) throw new Error(`No quote data for ${symbol}`);
-
-    const price         = parseNum(q['05. price']);
-    const previousClose = parseNum(q['08. previous close']);
-    const change        = parseNum(q['09. change']);
-    const changePct     = parseNum((q['10. change percent'] || '').replace('%', ''));
-    const volume        = parseNum(q['06. volume']);
+    const q = await yfQuote(symbol);
+    if (!q?.regularMarketPrice) throw new Error(`No quote data for ${symbol}`);
 
     const data = {
       symbol,
-      price,
-      previousClose,
-      change,
-      changePercent:           changePct,
-      bid:                     null,
-      ask:                     null,
-      volume,
-      dayHigh:                 null,
-      dayLow:                  null,
-      fiftyTwoWeekHigh:        null,
-      fiftyTwoWeekLow:         null,
-      marketState:             null,
-      shortName:               symbol,
-      postMarketPrice:         null,
-      postMarketChange:        null,
-      postMarketChangePercent: null,
-      postMarketTime:          null,
-      preMarketPrice:          null,
-      preMarketChange:         null,
-      preMarketChangePercent:  null,
-      preMarketTime:           null,
+      price:                     q.regularMarketPrice        ?? null,
+      previousClose:             q.regularMarketPreviousClose ?? null,
+      change:                    q.regularMarketChange       ?? null,
+      changePercent:             q.regularMarketChangePercent ?? null,
+      volume:                    q.regularMarketVolume       ?? null,
+      bid:                       q.bid                       ?? null,
+      ask:                       q.ask                       ?? null,
+      dayHigh:                   q.regularMarketDayHigh      ?? null,
+      dayLow:                    q.regularMarketDayLow       ?? null,
+      fiftyTwoWeekHigh:          q.fiftyTwoWeekHigh          ?? null,
+      fiftyTwoWeekLow:           q.fiftyTwoWeekLow           ?? null,
+      marketState:               q.marketState               ?? null,
+      shortName:                 q.shortName                 ?? symbol,
+      postMarketPrice:           q.postMarketPrice           ?? null,
+      postMarketChange:          q.postMarketChange          ?? null,
+      postMarketChangePercent:   q.postMarketChangePercent   ?? null,
+      postMarketTime:            q.postMarketTime            ?? null,
+      preMarketPrice:            q.preMarketPrice            ?? null,
+      preMarketChange:           q.preMarketChange           ?? null,
+      preMarketChangePercent:    q.preMarketChangePercent    ?? null,
+      preMarketTime:             q.preMarketTime             ?? null,
     };
 
     QUOTE_CACHE.set(symbol, { data, time: now });
@@ -200,18 +238,76 @@ router.get('/quote', async (req, res) => {
   }
 });
 
-// ── Monthly historical — Alpha Vantage TIME_SERIES_MONTHLY_ADJUSTED ───────────
+// ── Monthly historical — Yahoo Finance primary, Alpha Vantage fallback ────────
 // GET /market-data/monthly?tickers=AAPL,MSFT,SPY&months=36
+// Previously this hit Alpha Vantage directly and returned {} silently whenever
+// the daily cap was exceeded. Now we use Yahoo Finance (yf.historical, 1mo bars)
+// as the primary source and only fall back to AV if Yahoo fails for a ticker.
 const MONTHLY_CACHE = new Map();
-const MONTHLY_TTL = 60 * 60 * 1000; // 1 h
+const MONTHLY_TTL = 60 * 60 * 1000;
+
+async function monthlySeries(ticker) {
+  // Primary: Yahoo Finance (no rate limit, supports ETFs and index tickers)
+  try {
+    const rows = await yfHistorical(ticker, { months: 120, interval: '1mo' });
+    const series = yfRowsToSeries(rows);
+    if (series.length >= 3) return { series, source: 'yahoo' };
+  } catch (err) {
+    console.warn(`[monthlySeries/yf] ${ticker}: ${err.message}`);
+  }
+  // Fallback: Alpha Vantage
+  const series = await avMonthly(ticker);
+  return { series, source: 'alpha_vantage' };
+}
 
 router.get('/monthly', async (req, res) => {
   const tickers = (req.query.tickers || '')
     .split(',').map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 10);
   if (!tickers.length) return res.status(400).json({ error: 'tickers required' });
 
-  const months  = Math.min(parseInt(req.query.months) || 36, 120);
+  const months  = Math.min(parseInt(req.query.months) || 36, 240);
   const cacheKey = `${tickers.join(',')}_${months}`;
+  const now = Date.now();
+  const cached = MONTHLY_CACHE.get(cacheKey);
+  if (cached && now - cached.time < MONTHLY_TTL) return res.json(cached.data);
+
+  const results = {}, errors = {}, sources = {};
+  await Promise.allSettled(tickers.map(async (ticker) => {
+    try {
+      const { series, source } = await monthlySeries(ticker);
+      if (series.length < 3) { errors[ticker] = 'Insufficient data'; return; }
+      const slice = series.slice(-(months + 1));
+      const out = [];
+      for (let i = 1; i < slice.length; i++) {
+        const prev = slice[i - 1].adjClose;
+        if (!prev) continue;
+        out.push({
+          date:     dateKey(slice[i].date),
+          adjClose: +slice[i].adjClose.toFixed(4),
+          ret:      +(slice[i].adjClose / prev - 1).toFixed(6),
+        });
+      }
+      if (out.length < 2) { errors[ticker] = 'Insufficient data after slicing'; return; }
+      results[ticker] = out;
+      sources[ticker] = source;
+    } catch (err) { errors[ticker] = err.message; }
+  }));
+
+  const data = { data: results, errors, sources };
+  MONTHLY_CACHE.set(cacheKey, { data, time: now });
+  res.json(data);
+});
+
+// ── Yahoo-first monthly alias — explicitly bypasses AV ────────────────────────
+// GET /market-data/yf-monthly?tickers=SPY,GLD,TLT&months=72
+// Used by Strategy, Live Signal, and Backtest Stats pages.
+router.get('/yf-monthly', async (req, res) => {
+  const tickers = (req.query.tickers || '')
+    .split(',').map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 10);
+  if (!tickers.length) return res.status(400).json({ error: 'tickers required' });
+
+  const months = Math.min(parseInt(req.query.months) || 60, 240);
+  const cacheKey = `yf_${tickers.join(',')}_${months}`;
   const now = Date.now();
   const cached = MONTHLY_CACHE.get(cacheKey);
   if (cached && now - cached.time < MONTHLY_TTL) return res.json(cached.data);
@@ -219,16 +315,18 @@ router.get('/monthly', async (req, res) => {
   const results = {}, errors = {};
   await Promise.allSettled(tickers.map(async (ticker) => {
     try {
-      const rows = await avMonthly(ticker);
-      if (rows.length < 3) { errors[ticker] = 'Insufficient data'; return; }
-      // Take last (months + 1) rows so we can produce (months) return observations
-      const slice = rows.slice(-(months + 1));
+      const rows = await yfHistorical(ticker, { months, interval: '1mo' });
+      const series = yfRowsToSeries(rows);
+      if (series.length < 3) { errors[ticker] = 'Insufficient data'; return; }
+      const slice = series.slice(-(months + 1));
       const out = [];
       for (let i = 1; i < slice.length; i++) {
+        const prev = slice[i - 1].adjClose;
+        if (!prev) continue;
         out.push({
           date:     dateKey(slice[i].date),
           adjClose: +slice[i].adjClose.toFixed(4),
-          ret:      +(slice[i].adjClose / slice[i - 1].adjClose - 1).toFixed(6),
+          ret:      +(slice[i].adjClose / prev - 1).toFixed(6),
         });
       }
       if (out.length < 2) { errors[ticker] = 'Insufficient data after slicing'; return; }
@@ -241,10 +339,60 @@ router.get('/monthly', async (req, res) => {
   res.json(data);
 });
 
-// ── Daily historical — Alpha Vantage TIME_SERIES_DAILY_ADJUSTED ───────────────
+// ── Batch quotes — Yahoo Finance ──────────────────────────────────────────────
+// GET /market-data/yf-quotes?tickers=AAPL,MSFT,NVDA
+// Used by IC Vault to show live prices alongside memos.
+const YFQ_CACHE = new Map();
+const YFQ_TTL = 5 * 60 * 1000;
+
+router.get('/yf-quotes', async (req, res) => {
+  const tickers = (req.query.tickers || '')
+    .split(',').map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 50);
+  if (!tickers.length) return res.status(400).json({ error: 'tickers required' });
+
+  const cacheKey = tickers.join(',');
+  const now = Date.now();
+  const cached = YFQ_CACHE.get(cacheKey);
+  if (cached && now - cached.time < YFQ_TTL) return res.json(cached.data);
+
+  const out = {}, errors = {};
+  await Promise.allSettled(tickers.map(async (t) => {
+    try {
+      const q = await yfQuote(t);
+      if (!q) { errors[t] = 'No data'; return; }
+      out[t] = {
+        symbol: t,
+        price:         q.regularMarketPrice        ?? null,
+        change:        q.regularMarketChange       ?? null,
+        changePercent: q.regularMarketChangePercent ?? null,
+        previousClose: q.regularMarketPreviousClose ?? null,
+        marketState:   q.marketState ?? null,
+        shortName:     q.shortName ?? t,
+      };
+    } catch (err) { errors[t] = err.message; }
+  }));
+
+  const data = { data: out, errors };
+  YFQ_CACHE.set(cacheKey, { data, time: now });
+  res.json(data);
+});
+
+// ── Daily historical — Yahoo primary, AV fallback ──────────────────────────────
 // GET /market-data/daily?tickers=AAPL,SPY&start=2023-01-01&end=2024-06-01
 const DAILY_CACHE = new Map();
-const DAILY_TTL   = 30 * 60 * 1000; // 30 min
+const DAILY_TTL   = 30 * 60 * 1000;
+
+async function dailySeries(ticker, start, end) {
+  try {
+    const rows = await yfHistoricalDaily(ticker, start, end);
+    const series = yfRowsToSeries(rows);
+    if (series.length >= 5) return series;
+  } catch (err) {
+    console.warn(`[dailySeries/yf] ${ticker}: ${err.message}`);
+  }
+  const rows = await avDaily(ticker);
+  return rows.filter(r => r.date >= start && r.date <= end);
+}
 
 router.get('/daily', async (req, res) => {
   const tickers = (req.query.tickers || '')
@@ -262,10 +410,9 @@ router.get('/daily', async (req, res) => {
   const results = {}, errors = {};
   await Promise.allSettled(tickers.map(async (ticker) => {
     try {
-      const rows = await avDaily(ticker);
-      const filtered = rows.filter(r => r.date >= start && r.date <= end);
-      if (filtered.length < 5) { errors[ticker] = 'Insufficient data'; return; }
-      results[ticker] = filtered.map(r => ({
+      const series = await dailySeries(ticker, start, end);
+      if (series.length < 5) { errors[ticker] = 'Insufficient data'; return; }
+      results[ticker] = series.map(r => ({
         date:     r.date,
         adjClose: +r.adjClose.toFixed(4),
       }));
@@ -277,15 +424,15 @@ router.get('/daily', async (req, res) => {
   res.json(data);
 });
 
-// ── Fama-French factor proxies — Alpha Vantage ────────────────────────────────
+// ── Fama-French factor proxies — Yahoo Finance ─────────────────────────────────
 // GET /market-data/ff-proxy?months=60
 // MKT=SPY-BIL, SMB=IWM-SPY, HML=SPYV-SPYG
 const FF_TICKERS = ['SPY', 'IWM', 'SPYV', 'SPYG', 'BIL'];
 let FF_CACHE = null, FF_CACHE_TIME = 0;
-const FF_TTL = 6 * 60 * 60 * 1000; // 6 h
+const FF_TTL = 6 * 60 * 60 * 1000;
 
 router.get('/ff-proxy', async (req, res) => {
-  const months = Math.min(parseInt(req.query.months) || 60, 120);
+  const months = Math.min(parseInt(req.query.months) || 60, 240);
   const now = Date.now();
   if (FF_CACHE && now - FF_CACHE_TIME < FF_TTL && FF_CACHE.length >= months)
     return res.json(FF_CACHE.slice(-months));
@@ -293,12 +440,14 @@ router.get('/ff-proxy', async (req, res) => {
   try {
     const allData = {};
     await Promise.all(FF_TICKERS.map(async (t) => {
-      const rows = await avMonthly(t);
+      const { series } = await monthlySeries(t);
       const rets = [];
-      for (let i = 1; i < rows.length; i++) {
+      for (let i = 1; i < series.length; i++) {
+        const prev = series[i - 1].adjClose;
+        if (!prev) continue;
         rets.push({
-          date: dateKey(rows[i].date),
-          ret:  rows[i].adjClose / rows[i - 1].adjClose - 1,
+          date: dateKey(series[i].date),
+          ret:  series[i].adjClose / prev - 1,
         });
       }
       allData[t] = rets;
@@ -329,7 +478,7 @@ router.get('/ff-proxy', async (req, res) => {
   }
 });
 
-// ── Options chain — Yahoo Finance (AV options requires a paid plan) ────────────
+// ── Options chain — Yahoo Finance ──────────────────────────────────────────────
 // GET /market-data/options?ticker=QQQ
 router.get('/options', async (req, res) => {
   const ticker = (req.query.ticker || 'QQQ').toUpperCase();
@@ -340,6 +489,7 @@ router.get('/options', async (req, res) => {
 
     const spotQuote = await yfQuote(ticker);
     const spot = spotQuote.regularMarketPrice;
+    if (!spot) return res.status(404).json({ error: 'No spot price for ' + ticker });
 
     const selected = expiryDates.slice(0, 8);
     const now = new Date();
@@ -382,6 +532,8 @@ router.get('/options', async (req, res) => {
       surface.push({ expiry: expiryStr, dte, strikes });
     });
 
+    if (!surface.length) return res.status(404).json({ error: 'No usable IV data — all expirations had fewer than 3 strikes with valid IV.' });
+
     res.json({ ticker, spot, marketState: spotQuote.marketState ?? 'CLOSED', surface });
   } catch (err) {
     console.error('[market-data /options]', ticker, err.message);
@@ -389,10 +541,106 @@ router.get('/options', async (req, res) => {
   }
 });
 
-// ── Fundamentals — Alpha Vantage ──────────────────────────────────────────────
+// ── Put-call parity scanner — Yahoo Finance ────────────────────────────────────
+// GET /market-data/options-parity?ticker=SPY&expiry=0
+// Returns per-strike parity-violation data for a single expiry.
+router.get('/options-parity', async (req, res) => {
+  const ticker   = (req.query.ticker || 'SPY').toUpperCase();
+  const expiryIdx = Math.max(0, Math.min(parseInt(req.query.expiry) || 0, 12));
+  const rRate    = 0.045;
+
+  try {
+    const base = await yfOptions(ticker);
+    const expiryDates = base.expirationDates || [];
+    if (!expiryDates.length) return res.status(404).json({ error: 'No options for ' + ticker });
+
+    const spotQuote = await yfQuote(ticker);
+    const spot = spotQuote.regularMarketPrice;
+    if (!spot) return res.status(404).json({ error: 'No spot price' });
+
+    const selectable = expiryDates.slice(0, 12);
+    const idx = Math.min(expiryIdx, selectable.length - 1);
+    const toDate = (d) => d instanceof Date ? d : new Date(d * 1000);
+    const expDate = toDate(selectable[idx]);
+    const dte = Math.max(1, Math.round((expDate - new Date()) / (1000 * 60 * 60 * 24)));
+    const T = dte / 365;
+
+    const chain = await yfOptions(ticker, { date: expDate });
+    const opts  = chain.options?.[0] || {};
+    const calls = opts.calls || [];
+    const puts  = opts.puts  || [];
+
+    const putMap = Object.fromEntries(puts.map(p => [p.strike, p]));
+    const pairs = [];
+    for (const c of calls) {
+      const p = putMap[c.strike];
+      if (!p) continue;
+      const callBid = c.bid ?? c.lastPrice;
+      const callAsk = c.ask ?? c.lastPrice;
+      const putBid  = p.bid ?? p.lastPrice;
+      const putAsk  = p.ask ?? p.lastPrice;
+      if (callBid == null || callAsk == null || putBid == null || putAsk == null) continue;
+      const callMid = (callBid + callAsk) / 2;
+      const putMid  = (putBid  + putAsk ) / 2;
+      if (!(callMid > 0) || !(putMid > 0)) continue;
+
+      const parityLHS = callMid - putMid;
+      const parityRHS = spot - c.strike * Math.exp(-rRate * T);
+      const violation = parityLHS - parityRHS;
+      const callSpread = Math.max(0, callAsk - callBid);
+      const putSpread  = Math.max(0, putAsk  - putBid);
+      const spread     = (callSpread + putSpread) / 2;
+
+      const callIV = (c.impliedVolatility ?? 0) * 100;
+      const putIV  = (p.impliedVolatility ?? 0) * 100;
+      const ivSpread = callIV - putIV;
+
+      pairs.push({
+        strike: c.strike,
+        callBid, callAsk, putBid, putAsk,
+        callMid: +callMid.toFixed(4),
+        putMid:  +putMid.toFixed(4),
+        parityLHS: +parityLHS.toFixed(4),
+        parityRHS: +parityRHS.toFixed(4),
+        violation: +violation.toFixed(4),
+        spread:    +spread.toFixed(4),
+        callIV:    +callIV.toFixed(2),
+        putIV:     +putIV.toFixed(2),
+        ivSpread:  +ivSpread.toFixed(2),
+        sigViolation: Math.abs(violation) > Math.max(spread, 0.05),
+      });
+    }
+    pairs.sort((a, b) => a.strike - b.strike);
+
+    const expiryDatesStr = selectable.map(d => toDate(d).toISOString().slice(0, 10));
+
+    res.json({
+      ticker, spot,
+      expiry: expDate.toISOString().slice(0, 10),
+      dte,
+      expiryDates: expiryDatesStr,
+      pairs,
+    });
+  } catch (err) {
+    console.error('[market-data /options-parity]', ticker, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Fundamentals — Yahoo Finance quoteSummary (no Alpha Vantage dependency) ───
 // GET /market-data/fundamentals?ticker=AAPL
 const FUND_CACHE = new Map();
-const FUND_TTL = 6 * 60 * 60 * 1000; // 6 h
+const FUND_TTL = 6 * 60 * 60 * 1000;
+
+const YF_FUND_MODULES = [
+  'incomeStatementHistory',
+  'cashflowStatementHistory',
+  'balanceSheetHistory',
+  'defaultKeyStatistics',
+  'financialData',
+  'summaryDetail',
+  'price',
+];
 
 router.get('/fundamentals', async (req, res) => {
   const ticker = (req.query.ticker || 'AAPL').toUpperCase();
@@ -401,78 +649,83 @@ router.get('/fundamentals', async (req, res) => {
   if (cached && now - cached.time < FUND_TTL) return res.json(cached.data);
 
   try {
-    const [overview, income, cashflow, balance, quoteRaw] = await Promise.all([
-      avFetch({ function: 'OVERVIEW',         symbol: ticker }),
-      avFetch({ function: 'INCOME_STATEMENT', symbol: ticker }),
-      avFetch({ function: 'CASH_FLOW',        symbol: ticker }),
-      avFetch({ function: 'BALANCE_SHEET',    symbol: ticker }),
-      avFetch({ function: 'GLOBAL_QUOTE',     symbol: ticker }),
+    const [summary, priceQuote] = await Promise.all([
+      yfQueue(() => yf.quoteSummary(ticker, { modules: YF_FUND_MODULES }, { validateResult: false })),
+      yfQuote(ticker),
     ]);
 
-    const incomeReports  = income.annualReports  || [];
-    const cashReports    = cashflow.annualReports || [];
-    const balanceReports = balance.annualReports  || [];
+    const priceModule   = summary.price              || {};
+    const keyStats      = summary.defaultKeyStatistics || {};
+    const financialData = summary.financialData       || {};
+    const summaryDetail = summary.summaryDetail       || {};
 
-    const cashMap    = Object.fromEntries(cashReports.map(r   => [r.fiscalDateEnding, r]));
-    const balanceMap = Object.fromEntries(balanceReports.map(r => [r.fiscalDateEnding, r]));
+    const getRaw = (v) => {
+      if (v == null) return null;
+      if (typeof v === 'object' && 'raw' in v) return v.raw;
+      return typeof v === 'number' ? v : null;
+    };
 
-    const years = incomeReports
-      .filter(r => r.totalRevenue && r.totalRevenue !== 'None')
-      .sort((a, b) => a.fiscalDateEnding.localeCompare(b.fiscalDateEnding))
+    const currentPrice    = priceQuote?.regularMarketPrice ?? getRaw(priceModule.regularMarketPrice) ?? null;
+    const marketCap       = getRaw(priceModule.marketCap)   ?? getRaw(summaryDetail.marketCap)   ?? null;
+    const sharesOutstanding = getRaw(keyStats.sharesOutstanding) ?? null;
+    const beta            = getRaw(keyStats.beta)           ?? getRaw(summaryDetail.beta)         ?? null;
+
+    const incomeStmts  = summary.incomeStatementHistory?.incomeStatementHistory   || [];
+    const cashStmts    = summary.cashflowStatementHistory?.cashflowStatements      || [];
+    const balanceStmts = summary.balanceSheetHistory?.balanceSheetStatements       || [];
+
+    if (!incomeStmts.length) throw new Error(`No financial statements for ${ticker} — check the ticker.`);
+
+    const fmtDate = (r) => r?.endDate?.fmt ?? r?.endDate ?? null;
+    const cashMap    = Object.fromEntries(cashStmts.map(r    => [fmtDate(r), r]));
+    const balanceMap = Object.fromEntries(balanceStmts.map(r => [fmtDate(r), r]));
+
+    const years = incomeStmts
+      .sort((a, b) => (fmtDate(a) ?? '').localeCompare(fmtDate(b) ?? ''))
       .map(inc => {
-        const cf = cashMap[inc.fiscalDateEnding]    || {};
-        const bs = balanceMap[inc.fiscalDateEnding] || {};
+        const dateKey    = fmtDate(inc);
+        const cf         = cashMap[dateKey]    || {};
+        const bs         = balanceMap[dateKey] || {};
 
-        const operatingCF = parseNum(cf.operatingCashflow);
-        const capexRaw    = parseNum(cf.capitalExpenditures);
+        const revenue    = getRaw(inc.totalRevenue);
+        if (!revenue) return null;
+
+        const operatingCF = getRaw(cf.totalCashFromOperatingActivities);
+        const capexRaw    = getRaw(cf.capitalExpenditures);
         const capex       = capexRaw != null ? Math.abs(capexRaw) : null;
-        const da          = parseNum(cf.depreciationDepletionAndAmortization)
-                         ?? parseNum(inc.depreciationAndAmortization);
+        const da          = getRaw(cf.depreciation) ?? getRaw(cf.depreciationAndAmortization);
         const fcf         = operatingCF != null && capex != null ? operatingCF - capex : null;
 
         return {
-          year:         parseInt(inc.fiscalDateEnding.slice(0, 4)),
-          revenue:      parseNum(inc.totalRevenue),
-          grossProfit:  parseNum(inc.grossProfit),
-          ebit:         parseNum(inc.ebit) ?? parseNum(inc.operatingIncome),
-          ebitda:       parseNum(inc.ebitda),
-          netIncome:    parseNum(inc.netIncome),
-          operatingCF,
-          capex,
-          da,
-          freeCashFlow: fcf,
-          cash:      parseNum(bs.cashAndShortTermInvestments)
-                  ?? parseNum(bs.cashAndCashEquivalentsAtCarryingValue),
-          totalDebt: parseNum(bs.shortLongTermDebtTotal) ?? parseNum(bs.longTermDebt),
+          year:        parseInt((dateKey ?? '0000').slice(0, 4)),
+          revenue,
+          grossProfit: getRaw(inc.grossProfit),
+          ebit:        getRaw(inc.ebit) ?? getRaw(inc.operatingIncome),
+          ebitda:      null,
+          netIncome:   getRaw(inc.netIncome),
+          operatingCF, capex, da, freeCashFlow: fcf,
+          cash:      getRaw(bs.cash) ?? getRaw(bs.cashAndCashEquivalents),
+          totalDebt: getRaw(bs.longTermDebt) ?? getRaw(bs.shortLongTermDebt),
         };
       })
-      .filter(y => y.revenue != null);
+      .filter(Boolean);
 
-    // Effective tax rate from most recent annual report
-    const lastInc      = [...incomeReports].sort((a, b) => b.fiscalDateEnding.localeCompare(a.fiscalDateEnding))[0] || {};
-    const incomeBefore = parseNum(lastInc.incomeBeforeTax);
-    const incomeTax    = parseNum(lastInc.incomeTaxExpense);
-    const taxRate      = incomeBefore && incomeTax && incomeBefore > 0
-      ? Math.min(incomeTax / incomeBefore, 0.60)
+    const taxRate = financialData.effectiveTaxRate != null
+      ? Math.min(getRaw(financialData.effectiveTaxRate) ?? 0.25, 0.60)
       : null;
 
-    const gq = quoteRaw['Global Quote'] || {};
-    const currentPrice = parseNum(gq['05. price']);
-
-    const latestBs = [...balanceReports].sort((a, b) =>
-      b.fiscalDateEnding.localeCompare(a.fiscalDateEnding))[0] || {};
+    const latestBs = balanceStmts[balanceStmts.length - 1] || {};
 
     const data = {
       ticker,
-      shortName:         overview.Name || ticker,
+      shortName:         priceModule.shortName ?? priceModule.longName ?? ticker,
       currentPrice,
-      marketCap:         parseNum(overview.MarketCapitalization),
-      sharesOutstanding: parseNum(overview.SharesOutstanding),
-      beta:              parseNum(overview.Beta),
+      marketCap,
+      sharesOutstanding,
+      beta,
       taxRate,
-      totalDebt:  parseNum(latestBs.shortLongTermDebtTotal) ?? parseNum(latestBs.longTermDebt),
-      totalCash:  parseNum(latestBs.cashAndShortTermInvestments)
-               ?? parseNum(latestBs.cashAndCashEquivalentsAtCarryingValue),
+      totalDebt: getRaw(latestBs.longTermDebt) ?? getRaw(latestBs.shortLongTermDebt) ?? null,
+      totalCash: getRaw(latestBs.cash)         ?? getRaw(latestBs.cashAndCashEquivalents) ?? null,
       years,
     };
 
@@ -481,15 +734,14 @@ router.get('/fundamentals', async (req, res) => {
   } catch (err) {
     console.error('[market-data /fundamentals]', ticker, err.message);
     const stale = FUND_CACHE.get(ticker);
-    if (stale) return res.json(stale.data);
+    if (stale) return res.json({ ...stale.data, _stale: true, _error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Morning Note — Yahoo Finance (needs futures + yield curve, not in AV) ─────
-// GET /market-data/morning-note
+// ── Morning Note — Yahoo Finance ───────────────────────────────────────────────
 let MN_CACHE = null, MN_CACHE_TIME = 0;
-const MN_TTL = 15 * 60 * 1000; // 15 min
+const MN_TTL = 15 * 60 * 1000;
 
 const YIELD_TICKERS  = { '3M': '^IRX', '2Y': '^TYX', '5Y': '^FVX', '10Y': '^TNX' };
 const FUTURE_TICKERS = { 'ES': 'ES=F', 'NQ': 'NQ=F', 'YM': 'YM=F' };
@@ -579,7 +831,7 @@ router.get('/morning-note', async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('[market-data /morning-note]', err.message);
-    if (MN_CACHE) return res.json(MN_CACHE); // serve stale on error
+    if (MN_CACHE) return res.json(MN_CACHE);
     res.status(500).json({ error: err.message });
   }
 });
