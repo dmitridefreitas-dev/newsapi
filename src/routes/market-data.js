@@ -562,11 +562,9 @@ const FUND_CACHE = new Map();
 const FUND_TTL = 6 * 60 * 60 * 1000;
 
 const YF_FUND_MODULES = [
-  'incomeStatementHistory',
-  'cashflowStatementHistory',
-  'balanceSheetHistory',
-  'defaultKeyStatistics',
+  'earnings',
   'financialData',
+  'defaultKeyStatistics',
   'summaryDetail',
   'price',
 ];
@@ -577,84 +575,273 @@ router.get('/fundamentals', async (req, res) => {
   const cached = FUND_CACHE.get(ticker);
   if (cached && now - cached.time < FUND_TTL) return res.json(cached.data);
 
+  const getRaw = (v) => {
+    if (v == null) return null;
+    if (typeof v === 'object' && 'raw' in v) return v.raw;
+    return typeof v === 'number' ? v : null;
+  };
+
   try {
-    const [summary, priceQuote] = await Promise.all([
-      yfQueue(() => yf.quoteSummary(ticker, { modules: YF_FUND_MODULES }, { validateResult: false })),
-      yfQuote(ticker),
-    ]);
+    const fiveYearsAgo = new Date();
+    fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
+    const period1 = fiveYearsAgo.toISOString().slice(0, 10);
 
-    const priceModule   = summary.price              || {};
-    const keyStats      = summary.defaultKeyStatistics || {};
-    const financialData = summary.financialData       || {};
-    const summaryDetail = summary.summaryDetail       || {};
-
-    const getRaw = (v) => {
-      if (v == null) return null;
-      if (typeof v === 'object' && 'raw' in v) return v.raw;
-      return typeof v === 'number' ? v : null;
+    const safeTs = async (module, type) => {
+      try {
+        return await yfQueue(() => yf.fundamentalsTimeSeries(
+          ticker,
+          type ? { module, period1, type } : { module, period1 },
+          { validateResult: false }
+        ));
+      } catch (err) {
+        console.warn(`[fundamentals ts/${module}/${type || 'default'}] ${ticker}: ${err.message}`);
+        return [];
+      }
     };
 
-    const currentPrice    = priceQuote?.regularMarketPrice ?? getRaw(priceModule.regularMarketPrice) ?? null;
-    const marketCap       = getRaw(priceModule.marketCap)   ?? getRaw(summaryDetail.marketCap)   ?? null;
+    // Yahoo's default returns only ~5 quarters; `type: 'annual'` returns 4-5
+    // years of full-year data which is what we actually want for the DCF.
+    // We fetch annual first; if empty, fall back to quarterly and aggregate.
+    const [
+      summary, priceQuote,
+      tsFinancialsA, tsCashFlowA, tsBalanceA,
+      tsFinancialsQ, tsCashFlowQ, tsBalanceQ,
+    ] = await Promise.all([
+      yfQueue(() => yf.quoteSummary(ticker, { modules: YF_FUND_MODULES }, { validateResult: false })),
+      yfQuote(ticker),
+      safeTs('financials',    'annual'),
+      safeTs('cash-flow',     'annual'),
+      safeTs('balance-sheet', 'annual'),
+      safeTs('financials',    null),
+      safeTs('cash-flow',     null),
+      safeTs('balance-sheet', null),
+    ]);
+
+    const tsFinancials = Array.isArray(tsFinancialsA) && tsFinancialsA.length ? tsFinancialsA : tsFinancialsQ;
+    const tsCashFlow   = Array.isArray(tsCashFlowA)   && tsCashFlowA.length   ? tsCashFlowA   : tsCashFlowQ;
+    const tsBalance    = Array.isArray(tsBalanceA)    && tsBalanceA.length    ? tsBalanceA    : tsBalanceQ;
+
+    const priceModule   = summary.price                || {};
+    const keyStats      = summary.defaultKeyStatistics || {};
+    const financialData = summary.financialData        || {};
+    const summaryDetail = summary.summaryDetail        || {};
+    const earnings      = summary.earnings             || {};
+
+    const currentPrice      = priceQuote?.regularMarketPrice ?? getRaw(priceModule.regularMarketPrice) ?? null;
+    const marketCap         = getRaw(priceModule.marketCap)   ?? getRaw(summaryDetail.marketCap)   ?? null;
     const sharesOutstanding = getRaw(keyStats.sharesOutstanding) ?? null;
-    const beta            = getRaw(keyStats.beta)           ?? getRaw(summaryDetail.beta)         ?? null;
+    const beta              = getRaw(keyStats.beta) ?? getRaw(summaryDetail.beta) ?? null;
 
-    const incomeStmts  = summary.incomeStatementHistory?.incomeStatementHistory   || [];
-    const cashStmts    = summary.cashflowStatementHistory?.cashflowStatements      || [];
-    const balanceStmts = summary.balanceSheetHistory?.balanceSheetStatements       || [];
+    // ── TTM margins (from financialData) — used as fallback estimates ──────
+    const ttmGrossMargin      = getRaw(financialData.grossMargins);
+    const ttmOperatingMargin  = getRaw(financialData.operatingMargins);
+    const ttmEbitdaMargin     = getRaw(financialData.ebitdaMargins);
+    const ttmProfitMargin     = getRaw(financialData.profitMargins);
+    const ttmGrossProfits     = getRaw(financialData.grossProfits);
+    const ttmOperatingCF      = getRaw(financialData.operatingCashflow);
+    const ttmFreeCashFlow     = getRaw(financialData.freeCashflow);
+    const ttmEbitda           = getRaw(financialData.ebitda);
+    const ttmTotalDebt        = getRaw(financialData.totalDebt);
+    const ttmTotalCash        = getRaw(financialData.totalCash);
 
-    if (!incomeStmts.length) throw new Error(`No financial statements for ${ticker} — check the ticker.`);
+    // ── Base years from earnings.financialsChart.yearly ────────────────────
+    const yearlyEarnings = earnings?.financialsChart?.yearly || [];
+    if (!yearlyEarnings.length) {
+      throw new Error(`No earnings history for ${ticker} — check the ticker.`);
+    }
 
-    const fmtDate = (r) => r?.endDate?.fmt ?? r?.endDate ?? null;
-    const cashMap    = Object.fromEntries(cashStmts.map(r    => [fmtDate(r), r]));
-    const balanceMap = Object.fromEntries(balanceStmts.map(r => [fmtDate(r), r]));
+    // ── Helper: pick calendar year from a TS row ──────────────────────────
+    const rowYear = (r) => {
+      const d = r?.date;
+      if (!d) return null;
+      if (d instanceof Date) return d.getUTCFullYear();
+      const parsed = new Date(d);
+      return isNaN(parsed) ? null : parsed.getUTCFullYear();
+    };
 
-    const years = incomeStmts
-      .sort((a, b) => (fmtDate(a) ?? '').localeCompare(fmtDate(b) ?? ''))
-      .map(inc => {
-        const dateKey    = fmtDate(inc);
-        const cf         = cashMap[dateKey]    || {};
-        const bs         = balanceMap[dateKey] || {};
+    // ── Aggregate TS rows → per-calendar-year bucket. Annual rows (12M)
+    //    overwrite (count=4, one row per year); quarterly rows (3M) are summed.
+    const aggregateByYear = (rows, fields) => {
+      const byYear = {};
+      const list = (Array.isArray(rows) ? rows : []).filter(
+        r => r?.periodType === '3M' || r?.periodType === '12M'
+      );
+      for (const r of list) {
+        const y = rowYear(r);
+        if (y == null) continue;
+        if (!byYear[y]) byYear[y] = { _count: 0 };
+        if (r.periodType === '12M') {
+          // Annual row — treat as a complete year
+          byYear[y]._count = 4;
+          for (const f of fields) {
+            const v = getRaw(r[f]);
+            if (v != null) byYear[y][f] = v;
+          }
+        } else {
+          byYear[y]._count += 1;
+          for (const f of fields) {
+            const v = getRaw(r[f]);
+            if (v == null) continue;
+            byYear[y][f] = (byYear[y][f] ?? 0) + v;
+          }
+        }
+      }
+      return byYear;
+    };
 
-        const revenue    = getRaw(inc.totalRevenue);
-        if (!revenue) return null;
+    const finAnnual = aggregateByYear(tsFinancials, [
+      'totalRevenue', 'grossProfit', 'operatingIncome', 'netIncome',
+      'EBIT', 'EBITDA', 'reconciledDepreciation',
+    ]);
+    const cfAnnual  = aggregateByYear(tsCashFlow, [
+      'operatingCashFlow', 'capitalExpenditure', 'freeCashFlow',
+      'depreciationAndAmortization',
+    ]);
 
-        const operatingCF = getRaw(cf.totalCashFromOperatingActivities);
-        const capexRaw    = getRaw(cf.capitalExpenditures);
-        const capex       = capexRaw != null ? Math.abs(capexRaw) : null;
-        const da          = getRaw(cf.depreciation) ?? getRaw(cf.depreciationAndAmortization);
-        const fcf         = operatingCF != null && capex != null ? operatingCF - capex : null;
+    // ── Latest balance sheet row (sorted by date desc) ────────────────────
+    const balanceRows = (Array.isArray(tsBalance) ? tsBalance : [])
+      .slice()
+      .sort((a, b) => {
+        const da = a?.date instanceof Date ? a.date.getTime() : new Date(a?.date || 0).getTime();
+        const db = b?.date instanceof Date ? b.date.getTime() : new Date(b?.date || 0).getTime();
+        return db - da;
+      });
+    const latestBalance = balanceRows[0] || {};
 
-        return {
-          year:        parseInt((dateKey ?? '0000').slice(0, 4)),
-          revenue,
-          grossProfit: getRaw(inc.grossProfit),
-          ebit:        getRaw(inc.ebit) ?? getRaw(inc.operatingIncome),
-          ebitda:      null,
-          netIncome:   getRaw(inc.netIncome),
-          operatingCF, capex, da, freeCashFlow: fcf,
-          cash:      getRaw(bs.cash) ?? getRaw(bs.cashAndCashEquivalents),
-          totalDebt: getRaw(bs.longTermDebt) ?? getRaw(bs.shortLongTermDebt),
-        };
-      })
-      .filter(Boolean);
+    // Map each balance-sheet row by calendar year for per-year cash/debt fill
+    const balanceByYear = {};
+    for (const r of balanceRows) {
+      const y = rowYear(r);
+      if (y == null) continue;
+      // keep the latest (first occurrence in desc-sorted list) per year
+      if (!balanceByYear[y]) balanceByYear[y] = r;
+    }
 
-    const taxRate = financialData.effectiveTaxRate != null
-      ? Math.min(getRaw(financialData.effectiveTaxRate) ?? 0.25, 0.60)
-      : null;
+    // ── Build `years` array ───────────────────────────────────────────────
+    const sortedEarnings = yearlyEarnings
+      .slice()
+      .sort((a, b) => (a.date ?? 0) - (b.date ?? 0));
+    const maxYear = sortedEarnings.reduce(
+      (m, y) => Math.max(m, parseInt(y.date) || 0),
+      0
+    );
 
-    const latestBs = balanceStmts[balanceStmts.length - 1] || {};
+    const years = sortedEarnings.map(ey => {
+      const year = parseInt(ey.date) || null;
+      const revenueBase = getRaw(ey.revenue);
+      const netIncomeBase = getRaw(ey.earnings);
+
+      const fin = (year != null && finAnnual[year]) || null;
+      const cf  = (year != null && cfAnnual[year]) || null;
+      const bs  = (year != null && balanceByYear[year]) || null;
+
+      const hasFinQ = fin && fin._count >= 4;
+      const hasCfQ  = cf  && cf._count  >= 4;
+
+      // Revenue: prefer TS aggregated (if full year), else earnings chart
+      const revenue = hasFinQ && fin.totalRevenue != null ? fin.totalRevenue : revenueBase;
+
+      // Income-statement line items
+      let grossProfit = hasFinQ && fin.grossProfit != null ? fin.grossProfit : null;
+      let ebit        = hasFinQ && (fin.EBIT != null || fin.operatingIncome != null)
+                          ? (fin.EBIT ?? fin.operatingIncome) : null;
+      let ebitda      = hasFinQ && fin.EBITDA != null ? fin.EBITDA : null;
+      const netIncome = hasFinQ && fin.netIncome != null ? fin.netIncome : netIncomeBase;
+
+      // Cash-flow line items
+      let operatingCF  = hasCfQ && cf.operatingCashFlow != null ? cf.operatingCashFlow : null;
+      let capex        = hasCfQ && cf.capitalExpenditure != null ? Math.abs(cf.capitalExpenditure) : null;
+      let freeCashFlow = hasCfQ && cf.freeCashFlow != null ? cf.freeCashFlow : null;
+      let da           = hasCfQ && cf.depreciationAndAmortization != null
+                          ? cf.depreciationAndAmortization
+                          : (hasFinQ && fin.reconciledDepreciation != null ? fin.reconciledDepreciation : null);
+
+      // ── Fallback: most recent year — use TTM figures directly ─────────
+      const isMostRecent = year === maxYear;
+      if (isMostRecent) {
+        if (grossProfit == null && ttmGrossProfits != null) grossProfit = ttmGrossProfits;
+        if (ebitda == null      && ttmEbitda != null)       ebitda      = ttmEbitda;
+        if (operatingCF == null && ttmOperatingCF != null)  operatingCF = ttmOperatingCF;
+        if (freeCashFlow == null && ttmFreeCashFlow != null) freeCashFlow = ttmFreeCashFlow;
+      }
+
+      // ── Fallback: estimate from TTM margins × revenue ─────────────────
+      if (revenue != null) {
+        if (grossProfit == null && ttmGrossMargin != null)    grossProfit = ttmGrossMargin   * revenue;
+        if (ebit == null        && ttmOperatingMargin != null) ebit       = ttmOperatingMargin * revenue;
+        if (ebitda == null      && ttmEbitdaMargin != null)    ebitda     = ttmEbitdaMargin    * revenue;
+      }
+
+      // Derive FCF if we have OCF and capex but no explicit FCF
+      if (freeCashFlow == null && operatingCF != null && capex != null) {
+        freeCashFlow = operatingCF - capex;
+      }
+
+      // Per-year balance-sheet snapshot (falls back to latest)
+      const bsRow = bs || latestBalance;
+      const cash      = getRaw(bsRow.cashAndCashEquivalents)
+                        ?? getRaw(bsRow.cashCashEquivalentsAndShortTermInvestments)
+                        ?? null;
+      const totalDebt = getRaw(bsRow.totalDebt)
+                        ?? getRaw(bsRow.longTermDebt)
+                        ?? null;
+
+      return {
+        year,
+        revenue,
+        grossProfit,
+        ebit,
+        ebitda,
+        netIncome,
+        operatingCF,
+        capex,
+        da,
+        freeCashFlow,
+        cash,
+        totalDebt,
+      };
+    }).filter(y => y.year != null && y.revenue != null);
+
+    // ── Tax rate: financialData first, else last-year taxRateForCalcs ────
+    let taxRate = null;
+    const effTax = getRaw(financialData.effectiveTaxRate);
+    if (effTax != null) {
+      taxRate = Math.min(Math.max(effTax, 0), 0.60);
+    } else {
+      const finQRows = (Array.isArray(tsFinancials) ? tsFinancials : [])
+        .filter(r => r?.periodType === '3M' || r?.periodType === '12M')
+        .slice()
+        .sort((a, b) => {
+          const da = a?.date instanceof Date ? a.date.getTime() : new Date(a?.date || 0).getTime();
+          const db = b?.date instanceof Date ? b.date.getTime() : new Date(b?.date || 0).getTime();
+          return db - da;
+        });
+      for (const r of finQRows) {
+        const t = getRaw(r.taxRateForCalcs);
+        if (t != null) { taxRate = Math.min(Math.max(t, 0), 0.60); break; }
+      }
+    }
+
+    // ── Top-level totalDebt / totalCash: prefer latest balance sheet ─────
+    const topTotalDebt = getRaw(latestBalance.totalDebt)
+                         ?? getRaw(latestBalance.longTermDebt)
+                         ?? ttmTotalDebt
+                         ?? null;
+    const topTotalCash = getRaw(latestBalance.cashAndCashEquivalents)
+                         ?? getRaw(latestBalance.cashCashEquivalentsAndShortTermInvestments)
+                         ?? ttmTotalCash
+                         ?? null;
 
     const data = {
       ticker,
-      shortName:         priceModule.shortName ?? priceModule.longName ?? ticker,
+      shortName: priceModule.shortName ?? priceModule.longName ?? ticker,
       currentPrice,
       marketCap,
       sharesOutstanding,
       beta,
       taxRate,
-      totalDebt: getRaw(latestBs.longTermDebt) ?? getRaw(latestBs.shortLongTermDebt) ?? null,
-      totalCash: getRaw(latestBs.cash)         ?? getRaw(latestBs.cashAndCashEquivalents) ?? null,
+      totalDebt: topTotalDebt,
+      totalCash: topTotalCash,
       years,
     };
 
