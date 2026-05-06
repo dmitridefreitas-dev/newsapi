@@ -5,9 +5,6 @@ const router = express.Router();
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
 // ── Request queues — serialize external calls to avoid burst rate-limits ───────
-// Yahoo Finance has no explicit quota, but hammering their endpoints can lead to
-// temporary IP bans or crumb failures. 350ms spacing spreads bursts so concurrent
-// frontend requests don't all hit Yahoo at once.
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
 function makeQueue(gapMs) {
@@ -19,25 +16,47 @@ function makeQueue(gapMs) {
   };
 }
 
-// 1 Yahoo call every 350ms — spreads burst, avoids crumb hammering
-const yfQueue  = makeQueue(350);
+// 600ms gap — gives Yahoo's crumb endpoint more breathing room on shared Render IPs
+const yfQueue = makeQueue(600);
+
+// Retry wrapper: catches Yahoo 429/crumb errors and backs off before retrying.
+// Yahoo rate-limits the crumb endpoint on shared IPs; 3 attempts with 3s/6s/12s
+// delays is enough to ride out a transient throttle window.
+async function withRetry(fn, maxAttempts = 3, baseDelayMs = 3000) {
+  let lastErr;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message || '');
+      if (msg.includes('429') || msg.includes('crumb') || msg.includes('Too Many Requests')) {
+        const wait = baseDelayMs * Math.pow(2, i);
+        console.warn(`[yf retry ${i + 1}/${maxAttempts}] crumb/429 — waiting ${wait}ms`);
+        await delay(wait);
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw lastErr;
+}
 
 async function yfQuote(symbol) {
-  return yfQueue(() => yf.quote(symbol, {}, { validateResult: false }));
+  return withRetry(() => yfQueue(() => yf.quote(symbol, {}, { validateResult: false })));
 }
 
 async function yfOptions(symbol, opts) {
-  return yfQueue(() => yf.options(symbol, opts || {}, { validateResult: false }));
+  return withRetry(() => yfQueue(() => yf.options(symbol, opts || {}, { validateResult: false })));
 }
 
 // Yahoo Finance historical — returns [{date, open, high, low, close, adjClose, volume}]
 async function yfHistorical(symbol, { months, interval = '1mo' } = {}) {
   const endDate = new Date();
   const startDate = new Date();
-  // Extra buffer for the return calc (we need one row before the first target month)
   const bufferMonths = interval === '1mo' ? 3 : 0;
   startDate.setMonth(startDate.getMonth() - (months ?? 60) - bufferMonths);
-  return yfQueue(() => yf.historical(
+  return withRetry(() => yfQueue(() => yf.historical(
     symbol,
     {
       period1: startDate.toISOString().slice(0, 10),
@@ -45,17 +64,28 @@ async function yfHistorical(symbol, { months, interval = '1mo' } = {}) {
       interval,
     },
     { validateResult: false }
-  ));
+  )));
 }
 
 // Yahoo Finance historical — daily, start/end window
 async function yfHistoricalDaily(symbol, start, end) {
-  return yfQueue(() => yf.historical(
+  return withRetry(() => yfQueue(() => yf.historical(
     symbol,
     { period1: start, period2: end, interval: '1d' },
     { validateResult: false }
-  ));
+  )));
 }
+
+// Pre-warm the Yahoo Finance crumb 3s after module loads so the first real
+// requests find a cached crumb rather than racing to fetch one simultaneously.
+setTimeout(async () => {
+  try {
+    await withRetry(() => yf.quote('^GSPC', {}, { validateResult: false }));
+    console.log('[market-data] Yahoo Finance crumb pre-warmed');
+  } catch (err) {
+    console.warn('[market-data] Crumb pre-warm failed:', err.message);
+  }
+}, 3000);
 
 function parseNum(v) {
   if (v == null || v === 'None' || v === '-' || v === '') return null;
@@ -588,11 +618,11 @@ router.get('/fundamentals', async (req, res) => {
 
     const safeTs = async (module, type) => {
       try {
-        return await yfQueue(() => yf.fundamentalsTimeSeries(
+        return await withRetry(() => yfQueue(() => yf.fundamentalsTimeSeries(
           ticker,
           type ? { module, period1, type } : { module, period1 },
           { validateResult: false }
-        ));
+        )));
       } catch (err) {
         console.warn(`[fundamentals ts/${module}/${type || 'default'}] ${ticker}: ${err.message}`);
         return [];
@@ -607,7 +637,7 @@ router.get('/fundamentals', async (req, res) => {
       tsFinancialsA, tsCashFlowA, tsBalanceA,
       tsFinancialsQ, tsCashFlowQ, tsBalanceQ,
     ] = await Promise.all([
-      yfQueue(() => yf.quoteSummary(ticker, { modules: YF_FUND_MODULES }, { validateResult: false })),
+      withRetry(() => yfQueue(() => yf.quoteSummary(ticker, { modules: YF_FUND_MODULES }, { validateResult: false }))),
       yfQuote(ticker),
       safeTs('financials',    'annual'),
       safeTs('cash-flow',     'annual'),
