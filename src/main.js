@@ -4,11 +4,23 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
+import { ProxyAgent, setGlobalDispatcher } from 'undici';
 
 import routes from './routes/index.js';
 import { errorMiddleware } from './middleware/index.js';
 import logger from './utils/logger.js';
 
+
+// Route all outbound fetch() (incl. Yahoo Finance) through a residential proxy.
+// Datacenter IPs (Render, etc.) get 429 "Failed to get crumb" from Yahoo; a
+// residential proxy bypasses that. Set PROXY_URL on Render to e.g.
+// http://user:pass@host:port. Without it, requests go direct (current behaviour).
+if (process.env.PROXY_URL) {
+	setGlobalDispatcher(new ProxyAgent(process.env.PROXY_URL));
+	logger.info('🌐 Outbound HTTP routed through PROXY_URL');
+} else {
+	logger.warn('PROXY_URL not set — outbound calls go direct (Yahoo may 429 on cloud IPs)');
+}
 
 const app = express();
 app.set('etag', false);
