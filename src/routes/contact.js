@@ -4,19 +4,30 @@ import nodemailer from 'nodemailer';
 
 const router = express.Router();
 
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_PASSWORD,
-  },
-  // Fail fast instead of hanging the HTTP request when SMTP is unreachable.
+// Gmail app passwords are displayed as "abcd efgh ijkl mnop" — strip any
+// whitespace that came along with a copy/paste.
+const GMAIL_USER = (process.env.GMAIL_USER || '').trim();
+const GMAIL_PASSWORD = (process.env.GMAIL_PASSWORD || '').replace(/\s+/g, '');
+const RECIPIENT_EMAIL = (process.env.RECIPIENT_EMAIL || '').trim() || GMAIL_USER;
+
+const TIMEOUTS = {
   connectionTimeout: 10_000,
   greetingTimeout: 10_000,
   socketTimeout: 20_000,
-});
+};
+
+// Some hosts block STARTTLS on 587 but allow implicit TLS on 465 (or vice
+// versa) — try both before giving up.
+const TRANSPORTS = [
+  nodemailer.createTransport({
+    host: 'smtp.gmail.com', port: 465, secure: true,
+    auth: { user: GMAIL_USER, pass: GMAIL_PASSWORD }, ...TIMEOUTS,
+  }),
+  nodemailer.createTransport({
+    host: 'smtp.gmail.com', port: 587, secure: false,
+    auth: { user: GMAIL_USER, pass: GMAIL_PASSWORD }, ...TIMEOUTS,
+  }),
+];
 
 const escapeHtml = (s) =>
   String(s)
@@ -32,14 +43,14 @@ router.post('/send-email', async (req, res) => {
     return res.status(400).json({ error: 'missing_fields' });
   }
 
-  if (!process.env.GMAIL_USER || !process.env.GMAIL_PASSWORD || !process.env.RECIPIENT_EMAIL) {
-    console.error('[contact] GMAIL_USER / GMAIL_PASSWORD / RECIPIENT_EMAIL not configured');
+  if (!GMAIL_USER || !GMAIL_PASSWORD) {
+    console.error('[contact] GMAIL_USER / GMAIL_PASSWORD not configured');
     return res.status(503).json({ error: 'email_not_configured' });
   }
 
   const mailOptions = {
-    from: process.env.GMAIL_USER,
-    to: process.env.RECIPIENT_EMAIL,
+    from: GMAIL_USER,
+    to: RECIPIENT_EMAIL,
     replyTo: String(email),
     subject: `New Contact Form Submission from ${String(name).slice(0, 120)}`,
     html: `
@@ -51,13 +62,23 @@ router.post('/send-email', async (req, res) => {
     `,
   };
 
-  try {
-    await transporter.sendMail(mailOptions);
-    return res.json({ success: true, message: 'Email sent successfully' });
-  } catch (err) {
-    console.error('[contact] sendMail failed:', err.code || '', err.message);
-    return res.status(502).json({ error: 'send_failed' });
+  const failures = [];
+  for (const transporter of TRANSPORTS) {
+    const port = transporter.options.port;
+    try {
+      await transporter.sendMail(mailOptions);
+      console.log(`[contact] sent via port ${port}`);
+      return res.json({ success: true, message: 'Email sent successfully' });
+    } catch (err) {
+      console.error(`[contact] port ${port} failed:`, err.code || '', err.responseCode || '', err.message);
+      failures.push(`${port}:${err.code || err.responseCode || 'ERR'}`);
+    }
   }
+
+  // Expose the error codes (never credentials) so the failure mode is
+  // diagnosable from the client side: EAUTH = bad app password,
+  // ETIMEDOUT/ESOCKET = SMTP egress blocked by the host.
+  return res.status(502).json({ error: 'send_failed', detail: failures.join(',') });
 });
 
 export default router;
