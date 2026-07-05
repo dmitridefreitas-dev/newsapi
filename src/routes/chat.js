@@ -39,13 +39,13 @@ If a question is completely unrelated to Dmitri or this portfolio, politely redi
 
 === GITHUB — EXACT REPO URLS (use ONLY these, never invent or guess a GitHub URL) ===
 Profile: https://github.com/dmitridefreitas-dev
+C++ Matching Engine (CPP-017): https://github.com/dmitridefreitas-dev/matching-engine
 UTrucking AI (AI-016, voice assistant + revenue analytics): https://github.com/dmitridefreitas-dev/utrucking-ai
 Options Pricing Library (OPT-011): https://github.com/dmitridefreitas-dev/options-pricing-lib
 Honest Backtester (BTE-012): https://github.com/dmitridefreitas-dev/honest-backtester
 HMM Regime Detection (RGM-014): https://github.com/dmitridefreitas-dev/regime-detection
 Semiconductor Survival Analysis (SRV-013): https://github.com/dmitridefreitas-dev/designwin-survival
 Options-Chain ETL Pipeline (ODP-015): https://github.com/dmitridefreitas-dev/options-data-pipeline
-Quant libraries: https://github.com/dmitridefreitas-dev/svi-volatility-calibration , https://github.com/dmitridefreitas-dev/hmm-regime-detection , https://github.com/dmitridefreitas-dev/backtest-statistics
 Portfolio website source: https://github.com/dmitridefreitas-dev/mysite.dmitridefreitas.com
 RULE: If a URL does not appear verbatim in this prompt, DO NOT output it. Never construct repo names from project titles.
 
@@ -79,7 +79,9 @@ Personal Care Assistant — SMA patient in-home care (2025–2026).
 Duke of Edinburgh's International Award (2021) — Bronze Award expedition.
 Science Club President, Harrison College (2020–2021).
 
-=== ALL 16 PROJECTS ===
+=== ALL 17 PROJECTS ===
+CPP-017 "C++ Matching Engine — Two Books, Differentially Fuzzed": C++20 price-time-priority limit-order-book engine built twice — a std::map reference (the correctness oracle) and a cache-aware optimized engine (contiguous price ladder, object pool, intrusive doubly-linked FIFO queues). Differential fuzzing asserts identical fills, return values, and snapshots across hundreds of thousands of randomized ops, under ASan/UBSan in a gcc+clang CI matrix. TSC-timed benchmarks on a replayed LOBSTER AMZN day (269,748 messages): 1.44-1.49x median throughput (12.2M ops/s), p50 ~50ns vs ~90ns, with the sparse-ladder p99 tail regression reported honestly. Report + code: https://github.com/dmitridefreitas-dev/matching-engine
+
 AI-016 "UTrucking AI — Voice Assistant & Revenue Analytics": Production system for a university student storage company — Retell (GPT) voice phone assistant with identity verification and fuzzy order lookup, Python FastMCP/Starlette backend on Render, Google Sheets live data. Tested engines: instant quoting (validated 100% vs 654 real invoices), capacity-aware scheduling (revenue 74% concentrated in 5 days), billing-leakage detection (~$1,056 flagged). Revenue audit of ~1,660 dispatch records: $87,782 in a 13-day sprint. Report + code: https://github.com/dmitridefreitas-dev/utrucking-ai
 
 OPT-011 "Options Pricing Library": Three cross-validated option-pricing engines — Black-Scholes-Merton closed form, CRR binomial tree (European + American), Monte Carlo with antithetic variates — plus full Greeks, Brent implied-vol solver, IV-surface construction. 174 tests; put-call parity to 1e-14. Tech: Python, NumPy. Report + code: https://github.com/dmitridefreitas-dev/options-pricing-lib
