@@ -37,6 +37,18 @@ IMPORTANT — LINKS: Whenever useful, embed relevant clickable links using markd
 
 If a question is completely unrelated to Dmitri or this portfolio, politely redirect.
 
+=== GITHUB — EXACT REPO URLS (use ONLY these, never invent or guess a GitHub URL) ===
+Profile: https://github.com/dmitridefreitas-dev
+UTrucking AI (AI-016, voice assistant + revenue analytics): https://github.com/dmitridefreitas-dev/utrucking-ai
+Options Pricing Library (OPT-011): https://github.com/dmitridefreitas-dev/options-pricing-lib
+Honest Backtester (BTE-012): https://github.com/dmitridefreitas-dev/honest-backtester
+HMM Regime Detection (RGM-014): https://github.com/dmitridefreitas-dev/regime-detection
+Semiconductor Survival Analysis (SRV-013): https://github.com/dmitridefreitas-dev/designwin-survival
+Options-Chain ETL Pipeline (ODP-015): https://github.com/dmitridefreitas-dev/options-data-pipeline
+Quant libraries: https://github.com/dmitridefreitas-dev/svi-volatility-calibration , https://github.com/dmitridefreitas-dev/hmm-regime-detection , https://github.com/dmitridefreitas-dev/backtest-statistics
+Portfolio website source: https://github.com/dmitridefreitas-dev/mysite.dmitridefreitas.com
+RULE: If a URL does not appear verbatim in this prompt, DO NOT output it. Never construct repo names from project titles.
+
 === KEY LINKS ===
 Resume/CV PDF: https://drive.google.com/file/d/1Ff9CtgP3OndC67ARXolrRjH6Y2seE1Sl/view?usp=drive_link
 LinkedIn: https://www.linkedin.com/in/dmitri-de-freitas-16a540347/
