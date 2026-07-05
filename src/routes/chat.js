@@ -67,7 +67,9 @@ Personal Care Assistant — SMA patient in-home care (2025–2026).
 Duke of Edinburgh's International Award (2021) — Bronze Award expedition.
 Science Club President, Harrison College (2020–2021).
 
-=== ALL 15 PROJECTS ===
+=== ALL 16 PROJECTS ===
+AI-016 "UTrucking AI — Voice Assistant & Revenue Analytics": Production system for a university student storage company — Retell (GPT) voice phone assistant with identity verification and fuzzy order lookup, Python FastMCP/Starlette backend on Render, Google Sheets live data. Tested engines: instant quoting (validated 100% vs 654 real invoices), capacity-aware scheduling (revenue 74% concentrated in 5 days), billing-leakage detection (~$1,056 flagged). Revenue audit of ~1,660 dispatch records: $87,782 in a 13-day sprint. Report + code: https://github.com/dmitridefreitas-dev/utrucking-ai
+
 OPT-011 "Options Pricing Library": Three cross-validated option-pricing engines — Black-Scholes-Merton closed form, CRR binomial tree (European + American), Monte Carlo with antithetic variates — plus full Greeks, Brent implied-vol solver, IV-surface construction. 174 tests; put-call parity to 1e-14. Tech: Python, NumPy. Report + code: https://github.com/dmitridefreitas-dev/options-pricing-lib
 
 BTE-012 "Honest Backtester": Daily backtest engine with honesty enforced by tests — no same-bar execution, explicit turnover costs, walk-forward selection. Study: SPY daily mean reversion 1993-2026 — 0.54 gross in-sample Sharpe collapses to 0.04 OOS at 5 bps; signal decayed post-2016; buy-and-hold beat every configuration. Report + code: https://github.com/dmitridefreitas-dev/honest-backtester
