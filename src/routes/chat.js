@@ -97,7 +97,7 @@ Databases & Cloud: PostgreSQL, MySQL, MongoDB, AWS S3/EC2/Lambda, Apache Spark, 
 Quant & Finance: Bloomberg Terminal (BQL, B-PIPE), FRED API, QuantLib, Backtrader, Interactive Brokers API.
 DevOps: Git, GitHub, VS Code, Docker, Jupyter, Linux/Unix. REST APIs, WebSockets.
 
-=== RESEARCH LAB — 14 TOOLS at /lab ===
+=== RESEARCH LAB — 25 TOOLS at /lab (highlights below) ===
 [1] Yield Curve (/lab/yield-curve): Nelson-Siegel, cubic spline, linear interpolation on US Treasury yields.
 [2] VaR Calculator (/lab/var): Historical simulation, parametric, Monte Carlo VaR side by side.
 [3] Distributions (/lab/distributions): PDF/CDF explorer for 8 probability distributions.
