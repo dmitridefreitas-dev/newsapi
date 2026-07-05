@@ -67,7 +67,17 @@ Personal Care Assistant — SMA patient in-home care (2025–2026).
 Duke of Edinburgh's International Award (2021) — Bronze Award expedition.
 Science Club President, Harrison College (2020–2021).
 
-=== ALL 10 PROJECTS ===
+=== ALL 15 PROJECTS ===
+OPT-011 "Options Pricing Library": Three cross-validated option-pricing engines — Black-Scholes-Merton closed form, CRR binomial tree (European + American), Monte Carlo with antithetic variates — plus full Greeks, Brent implied-vol solver, IV-surface construction. 174 tests; put-call parity to 1e-14. Tech: Python, NumPy. Report + code: https://github.com/dmitridefreitas-dev/options-pricing-lib
+
+BTE-012 "Honest Backtester": Daily backtest engine with honesty enforced by tests — no same-bar execution, explicit turnover costs, walk-forward selection. Study: SPY daily mean reversion 1993-2026 — 0.54 gross in-sample Sharpe collapses to 0.04 OOS at 5 bps; signal decayed post-2016; buy-and-hold beat every configuration. Report + code: https://github.com/dmitridefreitas-dev/honest-backtester
+
+RGM-014 "Regime Detection & Lookahead Ladder": From-scratch 2-state Gaussian HMM (Baum-Welch, filtered vs smoothed, Viterbi) on SPY 1993-2026. Same allocation rule: Sharpe 0.78 honest vs 1.74 with smoothed (lookahead) probabilities. Regime scaling halves vol and cuts max drawdown -55% to -17%. Report + code: https://github.com/dmitridefreitas-dev/regime-detection
+
+SRV-013 "Semiconductor Survival Analysis": From-scratch Kaplan-Meier + log-rank (match lifelines to 1e-9), clustered Cox on 174 right-censored drawdown episodes (5 semis + SPY, 30 yrs). Severity-matched recovery gap vanishes (p=0.87); concurrent market stress cuts recovery hazard ~24% per 10pts SPY drawdown (p=1e-4). Report + code: https://github.com/dmitridefreitas-dev/designwin-survival
+
+ODP-015 "Options-Chain ETL Pipeline": Scheduled options data infrastructure — target-DTE fetching, append-only partitioned storage, tested derived features (ATM IV term structure, skew, expected move, IV rank). ~5,600 contracts/day, 21 offline tests. Report + code: https://github.com/dmitridefreitas-dev/options-data-pipeline
+
 PEAD-001: Statistical Analysis of Short-Term Market Efficiency Following Positive Earnings Surprises. 10.9% of stocks showed significant alpha. Data: Compustat, CRSP, I/B/E/S. Tech: Python.
 ETL-002: Institutional Data Integration Engine at Amphora. 80% reduction in manual processing. Tech: Python, Pandas, REST API, Excel/VBA, Power BI. Data: IBKR, Harmony, Bloomberg.
 TRAD-003: Quantitative Trading Deck — real-time crypto trading, asyncio WebSockets, sub-second execution. Tech: Python, WebSockets, Asyncio. Data: Binance, Coinbase Pro, Kraken.
